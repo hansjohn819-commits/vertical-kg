@@ -24,9 +24,10 @@ class GraphInstance:
 
     # --- Module delegates (filled in by later phases) ---
 
-    def ingest(self, raw_text: str, raw_doc_id: str) -> None:
-        """M1: raw → initial graph. Implemented in Phase 4."""
-        raise NotImplementedError("M1 ingest — Phase 4")
+    def ingest(self, raw_text: str, raw_doc_id: str):
+        """M1: raw → initial graph."""
+        from src.modules.m1_ingest import ingest_raw_text
+        return ingest_raw_text(self.storage, raw_text, raw_doc_id)
 
     def qa(self, question: str) -> str:
         """M2: agent-based Q&A. Implemented in Phase 5."""
@@ -34,13 +35,17 @@ class GraphInstance:
 
     def integrate(
         self,
-        fact_text: str,
+        statement: str,
         user_id: str,
         conversation_id: str,
         turn_id: str,
-    ) -> None:
-        """M3: online write from chat. Implemented in Phase 4."""
-        raise NotImplementedError("M3 integrate — Phase 4")
+    ):
+        """M3: online write from chat."""
+        from src.modules.m3_integrate import UserContext, integrate_user_statement
+        ctx = UserContext(
+            user_id=user_id, conversation_id=conversation_id, turn_id=turn_id
+        )
+        return integrate_user_statement(self.storage, statement, ctx)
 
     def sleep_pass(self) -> dict:
         """M4: periodic maintenance (4c→4b→4a→4d). Implemented in Phase 6."""

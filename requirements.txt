@@ -2,6 +2,7 @@ networkx>=3.6
 pydantic>=2.10
 python-dotenv>=1.0
 openai>=2.0
+tiktoken>=0.8
 langgraph>=0.2
 sentence-transformers>=3.0
 streamlit>=1.40
