@@ -56,5 +56,6 @@ def validate_env() -> dict:
         "agent": agent,
         "base_url": client.base_url,
         "model": client.model,
+        "context_tokens": client.context_tokens,
         "reachable": client.ping(),
     }
