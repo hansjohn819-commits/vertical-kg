@@ -30,8 +30,9 @@ class GraphInstance:
         return ingest_raw_text(self.storage, raw_text, raw_doc_id)
 
     def qa(self, question: str) -> str:
-        """M2: agent-based Q&A. Implemented in Phase 5."""
-        raise NotImplementedError("M2 qa — Phase 5")
+        """M2: agent-based Q&A."""
+        from src.modules.m2_qa_agent import GraphAgent
+        return GraphAgent(self).call(question)
 
     def integrate(
         self,

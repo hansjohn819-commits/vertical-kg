@@ -42,6 +42,39 @@ Requires a local OpenAI-compatible LLM endpoint (e.g. a local server hosting `go
 
 User interaction is **manually driven via the Streamlit chat** — real-world samples are pasted in by the user to simulate distributed, cross-time user behavior. There is no internal simulated-user harness.
 
+## Phase 5 — Tool-calling validation
+
+Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow the 2026-04-20 baseline at `F:\Master_CA\Python Test\test.py`.
+
+- **Round 1** — 9 tools exposed (read-only + evaluation). Write tools (`upsert_node`, `upsert_edge`) withheld on purpose; tier-9 "create a node" trap expects refusal. Strict rubric.
+- **Round 2** — all 11 tools exposed. Write-adjacent tier-9 cases use a lenient rubric that also accepts `graph_query` / `read_ontology` as preparatory check-before-write steps.
+
+| Tier | Round 1 (tool / param) | Round 2 (tool / param) |
+|---|---|---|
+| T1 基础 | 100% / 100% | 100% / 100% |
+| T2 多工具 | 100% / 100% | 100% / 100% |
+| T3 参数 | 100% / 100% | 100% / 100% |
+| T4 边界 | 100% / 100% | 100% / 100% |
+| T5 近义 | 100% / 100% | 100% / 100% |
+| T6 口语 | 100% / 100% | 100% / 100% |
+| T7 噪声 | 100% / 100% | 100% / 100% |
+| T8 多意图 | 100% / 100% | 100% / 100% |
+| T9 陷阱 | **95.0% / 95.0%** | **97.5% / 97.5%** |
+| T10 元意图 | 100% / 100% | 100% / 100% |
+
+Findings:
+
+1. **Exposing write tools did not pollute routing on other tiers** — T1–T8 and T10 stay at 100% in both rounds.
+2. **"Check-before-write" is a stable tendency**. In round 2, the "edit summary" prompt goes through `graph_query` 10/10 before attempting a write. Round 1 also shows 1/10 agents taking the same verify path even with no write tool available. This mirrors the verify-then-write pattern that M4 sleep pass uses under the LangGraph pass-within convergence loop (§5.0 option β).
+3. **Write tools are not exposed to chat in production.** `upsert_node` / `upsert_edge` are driven by M4 sleep pass. The round-2 lenient rubric reflects this: a preparatory query is not a failure, it is the same pattern the sleep pass itself follows.
+
+Rerun:
+
+```bash
+python -m tests.test_tool_calling both   # or 1 / 2
+# Results at results/round{1,2}.txt (gitignored)
+```
+
 ## License
 
 TBD.

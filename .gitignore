@@ -4,6 +4,7 @@ log.md
 data/raw/
 data/production/
 data/experiment/
+results/
 
 # --- Secrets & env ---
 .env
