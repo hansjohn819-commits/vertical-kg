@@ -1,0 +1,38 @@
+# --- Project-specific: private docs & runtime data ---
+project_guide.md
+log.md
+data/raw/
+data/production/
+data/experiment/
+
+# --- Secrets & env ---
+.env
+.env.local
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Build / dist ---
+build/
+dist/
+*.egg
