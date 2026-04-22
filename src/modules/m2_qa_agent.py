@@ -196,6 +196,29 @@ def _tool_schemas() -> dict[str, dict]:
                 },
             },
         },
+        "ingest_file": {
+            "type": "function",
+            "function": {
+                "name": "ingest_file",
+                "description": (
+                    "Load an authoritative raw document from data/raw/ and "
+                    "ingest it via M1 (DirectProv). Use when the user asks "
+                    "to load / import / ingest a file or document by name. "
+                    "NOT for user-contributed facts pasted into chat — "
+                    "those are M3's job via the Streamlit Ingest mode."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {
+                            "type": "string",
+                            "description": "File basename under data/raw/ (e.g., 'q1_report.txt'). Path components are stripped for safety.",
+                        },
+                    },
+                    "required": ["filename"],
+                },
+            },
+        },
     }
 
 
@@ -249,6 +272,7 @@ class GraphAgent:
             "compare_with_baseline": lambda a: {"status": "not_implemented"},
             "upsert_node": self._impl_upsert_node,
             "upsert_edge": self._impl_upsert_edge,
+            "ingest_file": self._impl_ingest_file,
         }
 
     def _impl_list_recent_merges(self, args: dict) -> dict:
@@ -350,6 +374,42 @@ class GraphAgent:
             user_ctx=self.user_ctx,
         )
         return {"source_id": e.source_id, "target_id": e.target_id, "type": e.type}
+
+    def _impl_ingest_file(self, args: dict) -> dict:
+        """Read data/raw/<basename> and ingest it via M1 (DirectProv).
+
+        Path traversal is prevented by reducing to `basename` and then
+        asserting the resolved path sits inside the data/raw/ directory.
+        """
+        raw_arg = str(args.get("filename", "")).strip()
+        if not raw_arg:
+            return {"error": "filename is required"}
+        basename = Path(raw_arg).name  # strip any directory components
+        raw_dir = (Path("data") / "raw").resolve()
+        target = (raw_dir / basename).resolve()
+        try:
+            target.relative_to(raw_dir)
+        except ValueError:
+            return {"error": f"refused: path escapes data/raw/ ({basename!r})"}
+        if not target.exists() or not target.is_file():
+            return {"error": f"no such file: data/raw/{basename}"}
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            return {"error": f"could not read as utf-8: {exc}"}
+        try:
+            result = self.instance.ingest(text, raw_doc_id=basename)
+        except Exception as exc:
+            return {"error": f"ingest failed: {exc}"}
+        self.instance.save()
+        return {
+            "status": "ok",
+            "filename": basename,
+            "run_id": result.run_id,
+            "nodes_added": result.nodes_added,
+            "edges_added": result.edges_added,
+            "edges_skipped": result.edges_skipped,
+        }
 
     # -- Public API --
 
