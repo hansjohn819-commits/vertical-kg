@@ -21,6 +21,11 @@ class GraphInstance:
         self.storage = GraphStorage(Path(storage_path) / "graph.pkl")
         self.storage.load()
         self.ontology_path = Path(ontology_path)
+        # Sync lock: while a sleep pass is running, the M2 agent refuses new
+        # requests (§14 wants sync semantics — pass runs matter more than chat
+        # availability). Implementation: simple bool, no threading needed since
+        # Phase 6 runs sleep pass synchronously in the agent's own process.
+        self.sleep_pass_running: bool = False
 
     # --- Module delegates (filled in by later phases) ---
 
@@ -49,8 +54,9 @@ class GraphInstance:
         return integrate_user_statement(self.storage, statement, ctx)
 
     def sleep_pass(self) -> dict:
-        """M4: periodic maintenance (4c→4b→4a→4d). Implemented in Phase 6."""
-        raise NotImplementedError("M4 sleep_pass — Phase 6")
+        """M4: periodic maintenance (4c→4b→4a→4d)."""
+        from src.modules.m4_sleep_pass.runner import run_sleep_pass
+        return run_sleep_pass(self)
 
     # --- Utilities ---
 

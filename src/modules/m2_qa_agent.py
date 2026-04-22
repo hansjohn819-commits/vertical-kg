@@ -14,6 +14,7 @@ from typing import Any, Callable
 from src.graph.instance import GraphInstance
 from src.graph.retrieval import top_k, with_neighbors
 from src.graph.tokens import count_tokens
+from src.graph.traversal_log import append_query
 from src.llm.routing import get_client
 from src.modules.m3_integrate import UserContext, upsert_edge, upsert_node
 
@@ -27,6 +28,34 @@ SYSTEM_PROMPT = (
 
 # Budget for graph_query retrieval context (§12.5.2).
 RETRIEVAL_BUDGET_TOKENS = 20_000
+
+# Path of the shared sleep-pass log (see m4_sleep_pass.pass_log).
+_PASS_LOG_PATH = Path("log.md")
+
+
+def _tail_log_events(kind: str, k: int) -> list[dict]:
+    """Return the last k JSON payloads in log.md whose kind matches.
+
+    log.md lines are of the form: '- [ts] kind summary | {json}'. We just
+    parse the JSON trailer.
+    """
+    import json as _json
+    if not _PASS_LOG_PATH.exists():
+        return []
+    out: list[dict] = []
+    for line in _PASS_LOG_PATH.read_text(encoding="utf-8").splitlines()[::-1]:
+        idx = line.rfind("| ")
+        if idx < 0:
+            continue
+        try:
+            payload = _json.loads(line[idx + 2:])
+        except _json.JSONDecodeError:
+            continue
+        if payload.get("kind") == kind:
+            out.append(payload)
+            if len(out) >= k:
+                break
+    return out
 
 
 # --- Tool schemas ------------------------------------------------------
@@ -210,10 +239,10 @@ class GraphAgent:
         gi = self.instance
         return {
             "graph_query": self._impl_graph_query,
-            "trigger_sleep_pass": lambda a: {"status": "not_implemented", "message": "Sleep pass is Phase 6."},
+            "trigger_sleep_pass": lambda a: gi.sleep_pass(),
             "get_graph_stats": lambda a: gi.storage.stats(),
-            "list_recent_merges": lambda a: {"merges": []},
-            "list_recent_prunings": lambda a: {"prunings": []},
+            "list_recent_merges": self._impl_list_recent_merges,
+            "list_recent_prunings": self._impl_list_recent_prunings,
             "show_provenance": self._impl_show_provenance,
             "read_ontology": self._impl_read_ontology,
             "run_plant_recover_eval": lambda a: {"status": "not_implemented"},
@@ -222,13 +251,23 @@ class GraphAgent:
             "upsert_edge": self._impl_upsert_edge,
         }
 
+    def _impl_list_recent_merges(self, args: dict) -> dict:
+        k = int(args.get("k", 10))
+        return {"merges": _tail_log_events("merge", k)}
+
+    def _impl_list_recent_prunings(self, args: dict) -> dict:
+        k = int(args.get("k", 10))
+        return {"prunings": _tail_log_events("prune", k)}
+
     def _impl_graph_query(self, args: dict) -> dict:
         q = str(args.get("question", ""))
-        seeds = top_k(self.instance.storage, q, k=5)
-        nodes = with_neighbors(self.instance.storage, seeds)
+        storage = self.instance.storage
+        seeds = top_k(storage, q, k=5)
+        nodes = with_neighbors(storage, seeds)
         # Budget summaries only, ≤20k tiktoken (§12.5).
         ctx_parts: list[str] = []
         tok = 0
+        included_ids: set[str] = set()
         for n in nodes:
             line = f"- [{n.type}] {n.label}: {n.summary}"
             t = count_tokens(line)
@@ -236,7 +275,20 @@ class GraphAgent:
                 break
             ctx_parts.append(line)
             tok += t
+            included_ids.add(n.id)
         ctx = "\n".join(ctx_parts) or "(empty graph)"
+        # Log everything that made it into context — 4c uses this to reinforce.
+        touched_edge_ids = [
+            e.id for e in storage.edges()
+            if e.source_id in included_ids and e.target_id in included_ids
+        ]
+        append_query(
+            storage,
+            question=q,
+            seed_node_ids=[n.id for n in seeds],
+            touched_node_ids=sorted(included_ids),
+            touched_edge_ids=touched_edge_ids,
+        )
         resp = self.client.chat(
             messages=[
                 {"role": "system", "content": "Answer the question from the graph context. Cite node labels in square brackets. If insufficient info, say so."},
@@ -303,6 +355,8 @@ class GraphAgent:
 
     def route(self, user_message: str, history: list[dict] | None = None) -> RouteResult:
         """Single LLM call; return tool selection without executing."""
+        if self.instance.sleep_pass_running:
+            return RouteResult(None, None, "Sleep pass is currently running; chat is paused until it finishes.", None)
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
@@ -331,6 +385,8 @@ class GraphAgent:
 
     def call(self, user_message: str, history: list[dict] | None = None) -> str:
         """Full loop: route, execute tool if any, synthesize final reply."""
+        if self.instance.sleep_pass_running:
+            return "Sleep pass is currently running; chat is paused until it finishes."
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)

@@ -50,6 +50,34 @@ class GraphStorage:
             if data is not None:
                 yield data
 
+    def get_edge(self, edge_id: str) -> Edge | None:
+        for e in self.edges():
+            if e.id == edge_id:
+                return e
+        return None
+
+    def remove_edge_by_id(self, edge_id: str) -> bool:
+        for u, v, k, attrs in list(self._g.edges(keys=True, data=True)):
+            data = attrs.get("data")
+            if data is not None and data.id == edge_id:
+                self._g.remove_edge(u, v, key=k)
+                return True
+        return False
+
+    def incident_edges(self, node_id: str) -> list[Edge]:
+        if node_id not in self._g:
+            return []
+        out: list[Edge] = []
+        for u, v, attrs in self._g.out_edges(node_id, data=True):
+            data = attrs.get("data")
+            if data is not None:
+                out.append(data)
+        for u, v, attrs in self._g.in_edges(node_id, data=True):
+            data = attrs.get("data")
+            if data is not None:
+                out.append(data)
+        return out
+
     def neighbors(self, node_id: str) -> list[Node]:
         if node_id not in self._g:
             return []

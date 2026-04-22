@@ -95,6 +95,7 @@ class Node(BaseModel):
 class Edge(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    id: str = Field(default_factory=_new_id)
     source_id: str
     target_id: str
     type: str

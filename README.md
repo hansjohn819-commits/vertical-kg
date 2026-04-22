@@ -42,6 +42,32 @@ Requires a local OpenAI-compatible LLM endpoint (e.g. a local server hosting `go
 
 User interaction is **manually driven via the Streamlit chat** — real-world samples are pasted in by the user to simulate distributed, cross-time user behavior. There is no internal simulated-user harness.
 
+## Phase 6 — Sleep pass (M4)
+
+The sleep pass is modeled as a LangGraph `StateGraph` over four sub-operations in the fixed order `4c → 4b → 4a → 4d` (guide §5). 4c is one-shot; 4b / 4a / 4d each live in a self-looping node that converges before the graph hands control to the next.
+
+Convergence rules (guide §5.0 + user direction):
+
+- **4b merge** — after each round, a fresh-memory LLM explicitly votes `stop` or `continue`. Hard cap `MERGE_MAX_ITER=10`.
+- **4a prune** — mechanical: round with no new deletion → exit.
+- **4d link-form** — mechanical: round with no new passing edge → exit. Pairs judged once are remembered per-pass so we do not re-ask rejections.
+
+Candidate generation for 4b combines (a) embedding top-k (`sentence-transformers/all-MiniLM-L6-v2`, reused from M2 retrieval), (b) neighbor-set Jaccard ≥ 0.3, and (c) same-type-with-cos ≥ 0.55 as documented in §5.5 "同类型也进候选". 4d seeds are this pass's merges plus the top-decile reinforced nodes, BFS to depth 2. 4d strictly drops any pair where the LLM cannot state both *what* the relation is and *why* it holds (§5.7 critical rule).
+
+`trigger_sleep_pass` runs synchronously. While a pass is in flight the M2 agent rejects new requests with `"Sleep pass is currently running"` — by design, the consolidation is the centerpiece, not chat availability.
+
+Smoke test (toy 12-node graph with Tesla Inc / Tesla Motors planted as a merge target):
+
+```bash
+python -m tests.test_sleep_pass
+```
+
+One full pass against the toy seed currently:
+
+- merges Tesla Inc + Tesla Motors into a single node (LLM reasoning cites the 2017 legal rename);
+- prunes a low-weight stale edge pre-marked suspicious;
+- adds one derived `MANUFACTURER_IN` edge Tesla → Electric Vehicles via 4d 2-hop BFS.
+
 ## Phase 5 — Tool-calling validation
 
 Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow the 2026-04-20 baseline at `F:\Master_CA\Python Test\test.py`.
