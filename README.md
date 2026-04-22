@@ -42,6 +42,17 @@ Requires a local OpenAI-compatible LLM endpoint (e.g. a local server hosting `go
 
 User interaction is **manually driven via the Streamlit chat** — real-world samples are pasted in by the user to simulate distributed, cross-time user behavior. There is no internal simulated-user harness.
 
+## Phase 7 — Streamlit chat
+
+Single-file dashboard at `src/dashboard/streamlit_app.py` wraps `GraphAgent` for the conversational path and `GraphInstance.integrate` for pasted-sample ingestion. All non-chat features (stats, sleep pass, provenance lookup, merge/prune history, ontology read, entity write) are exposed implicitly through the agent's tool box — the user asks, the agent picks the tool.
+
+Two modes via sidebar radio:
+
+- **Chat** — user message → `GraphAgent.call(msg, history)`. History is passed through a rolling token window (`HISTORY_BUDGET_TOKENS=3000`, per guide §12.5.2) so prompt size stays bounded no matter how long the session runs.
+- **Ingest sample** — pasted paragraph → `GraphInstance.integrate(...)`, which routes through M3's LLM-extract + classify + upsert. This is the path for guide §8's "人工在多次独立会话中分别粘入" behavior: each paste carries a fresh `turn_id` under one per-session `conversation_id`, so plant-and-recover evaluation can trace contributions per turn.
+
+Instance selector switches between `data/experiment` (where the toy seed lives) and `data/production`; storage is persisted after every turn. While `sleep_pass_running` is set by M4, the top banner flips to a pause notice and the agent itself short-circuits new requests (Phase 6 lock).
+
 ## Phase 6 — Sleep pass (M4)
 
 The sleep pass is modeled as a LangGraph `StateGraph` over four sub-operations in the fixed order `4c → 4b → 4a → 4d` (guide §5). 4c is one-shot; 4b / 4a / 4d each live in a self-looping node that converges before the graph hands control to the next.
