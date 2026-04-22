@@ -7,8 +7,11 @@ still see them in the schema list.
 """
 
 import json
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from src.graph.instance import GraphInstance
@@ -227,6 +230,71 @@ DEFAULT_ROUND1_TOOLS = [n for n in ALL_TOOL_NAMES if n not in ("upsert_node", "u
 DEFAULT_ROUND2_TOOLS = list(ALL_TOOL_NAMES)
 
 
+# --- Text-format tool-call fallback ------------------------------------
+#
+# Some models (e.g. Gemma) emit tool calls as text — `<|tool_call|>...`,
+# `<tool_call>...</tool_call>`, raw JSON, or `call:name{args}` — instead
+# of populating the OpenAI `tool_calls` field. This parser covers the
+# common shapes so the agent keeps working regardless of backend (LM
+# Studio, llama.cpp, vLLM) or chat-template version.
+
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<\|?\s*tool_call\s*\|?>(.+?)<\|?\s*/?\s*tool_call\s*\|?>",
+    re.DOTALL,
+)
+_GEMMA_QUOTE_RE = re.compile(r"<\|\"\|>")
+_CALL_BODY_RE = re.compile(
+    r"(?:call\s*:\s*)?([A-Za-z_]\w*)\s*\{(.*)\}",
+    re.DOTALL,
+)
+_BARE_KEY_RE = re.compile(r"([{,]\s*)([A-Za-z_]\w*)\s*:")
+
+
+def _parse_text_tool_call(content: str, allowed: list[str]) -> tuple[str, dict] | None:
+    if not content:
+        return None
+    m = _TOOL_CALL_BLOCK_RE.search(content)
+    body = m.group(1).strip() if m else content.strip()
+
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        obj = None
+    if isinstance(obj, dict):
+        name = obj.get("name") or obj.get("function")
+        args = obj.get("arguments") or obj.get("parameters") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if isinstance(name, str) and name in allowed and isinstance(args, dict):
+            return name, args
+
+    m = _CALL_BODY_RE.search(body)
+    if not m:
+        return None
+    name = m.group(1)
+    if name not in allowed:
+        return None
+    raw = "{" + m.group(2) + "}"
+    raw = _GEMMA_QUOTE_RE.sub('"', raw)
+    raw = _BARE_KEY_RE.sub(r'\1"\2":', raw)
+    try:
+        args = json.loads(raw)
+    except json.JSONDecodeError:
+        return name, {}
+    return (name, args) if isinstance(args, dict) else None
+
+
+def _synthesize_tool_call(name: str, args: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        id="fb_" + uuid.uuid4().hex[:8],
+        type="function",
+        function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+    )
+
+
 # --- Agent -------------------------------------------------------------
 
 @dataclass
@@ -433,6 +501,10 @@ class GraphAgent:
             return RouteResult(None, None, None, None, error=str(exc))
         msg = resp.choices[0].message
         calls = msg.tool_calls or []
+        if not calls:
+            fb = _parse_text_tool_call(msg.content or "", self.exposed_names)
+            if fb is not None:
+                calls = [_synthesize_tool_call(*fb)]
         if calls:
             first = calls[0]
             raw = first.function.arguments or "{}"
@@ -457,7 +529,10 @@ class GraphAgent:
         msg = resp.choices[0].message
         calls = msg.tool_calls or []
         if not calls:
-            return msg.content or ""
+            fb = _parse_text_tool_call(msg.content or "", self.exposed_names)
+            if fb is None:
+                return msg.content or ""
+            calls = [_synthesize_tool_call(*fb)]
         first = calls[0]
         name = first.function.name
         try:
