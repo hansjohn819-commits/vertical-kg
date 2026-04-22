@@ -42,18 +42,13 @@ Requires a local OpenAI-compatible LLM endpoint (e.g. a local server hosting `go
 
 User interaction is **manually driven via the Streamlit chat** — real-world samples are pasted in by the user to simulate distributed, cross-time user behavior. There is no internal simulated-user harness.
 
-## Phase 7 — Streamlit chat
+## Dashboard
 
-Single-file dashboard at `src/dashboard/streamlit_app.py` wraps `GraphAgent` for the conversational path and `GraphInstance.integrate` for pasted-sample ingestion. All non-chat features (stats, sleep pass, provenance lookup, merge/prune history, ontology read, entity write) are exposed implicitly through the agent's tool box — the user asks, the agent picks the tool.
+Single-file Streamlit app at `src/dashboard/streamlit_app.py` wraps `GraphAgent` as a chat surface. All capabilities — Q&A, stats, ingestion, sleep-pass trigger, provenance lookup, merge/prune history, ontology read, entity write — are exposed implicitly through the agent's tool box; the user asks in natural language, the agent picks the tool.
 
-Two modes via sidebar radio:
+Chat history is fed back to the agent through a rolling token window (`HISTORY_BUDGET_TOKENS=3000`), so prompt size stays bounded regardless of session length. Storage is persisted after every turn. While a sleep pass is in flight, the top banner flips to a pause notice and the agent short-circuits new requests — consolidation is the centerpiece, not chat availability.
 
-- **Chat** — user message → `GraphAgent.call(msg, history)`. History is passed through a rolling token window (`HISTORY_BUDGET_TOKENS=3000`) so prompt size stays bounded no matter how long the session runs.
-- **Ingest sample** — pasted paragraph → `GraphInstance.integrate(...)`, which routes through M3's LLM-extract + classify + upsert. This is the path for manually pasting bridge fragments across multiple independent sessions: each paste carries a fresh `turn_id` under one per-session `conversation_id`, so plant-and-recover evaluation can trace contributions per turn.
-
-Instance selector switches between `data/experiment` (where the toy seed lives) and `data/production`; storage is persisted after every turn. While `sleep_pass_running` is set by M4, the top banner flips to a pause notice and the agent itself short-circuits new requests (Phase 6 lock).
-
-## Phase 6 — Sleep pass (M4)
+## Core design: the sleep pass
 
 The sleep pass is modeled as a LangGraph `StateGraph` over four sub-operations in the fixed order `4c → 4b → 4a → 4d`. 4c (weight reinforcement) is one-shot; 4b (merge), 4a (prune), and 4d (link formation) each live in a self-looping node that converges before the graph hands control to the next.
 
@@ -65,7 +60,7 @@ Convergence rules:
 
 Candidate generation for 4b combines (a) embedding top-k (`sentence-transformers/all-MiniLM-L6-v2`, reused from M2 retrieval), (b) neighbor-set Jaccard ≥ 0.3, and (c) same-type-with-cos ≥ 0.55 (same-type pairs also qualify as candidates). 4d seeds are this pass's merges plus the top-decile reinforced nodes, BFS to depth 2. 4d strictly drops any pair where the LLM cannot state both *what* the relation is and *why* it holds.
 
-`trigger_sleep_pass` runs synchronously. While a pass is in flight the M2 agent rejects new requests with `"Sleep pass is currently running"` — by design, the consolidation is the centerpiece, not chat availability.
+`trigger_sleep_pass` runs synchronously; the M2 agent rejects new requests while it runs.
 
 Smoke test (toy 12-node graph with Tesla Inc / Tesla Motors planted as a merge target):
 
@@ -79,7 +74,7 @@ One full pass against the toy seed currently:
 - prunes a low-weight stale edge pre-marked suspicious;
 - adds one derived `MANUFACTURER_IN` edge Tesla → Electric Vehicles via 4d 2-hop BFS.
 
-## Phase 5 — Tool-calling validation
+## Tool-calling validation
 
 Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow an external baseline test harness.
 
