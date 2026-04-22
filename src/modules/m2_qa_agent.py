@@ -516,44 +516,60 @@ class GraphAgent:
         return RouteResult(None, None, msg.content, None)
 
     def call(self, user_message: str, history: list[dict] | None = None) -> str:
-        """Full loop: route, execute tool if any, synthesize final reply."""
+        """Multi-step tool loop: route → execute → feed result back → repeat
+        until the model returns a tool-free natural-language reply or
+        MAX_STEPS is reached. Works with both structured `tool_calls` and
+        text-format fallbacks (see `_parse_text_tool_call`)."""
         if self.instance.sleep_pass_running:
             return "Sleep pass is currently running; chat is paused until it finishes."
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
         messages.append({"role": "user", "content": user_message})
-        resp = self.client.chat(
-            messages=messages, tools=self.schemas, tool_choice="auto", temperature=0.7, timeout=120,
-        )
-        msg = resp.choices[0].message
-        calls = msg.tool_calls or []
-        if not calls:
-            fb = _parse_text_tool_call(msg.content or "", self.exposed_names)
-            if fb is None:
-                return msg.content or ""
-            calls = [_synthesize_tool_call(*fb)]
-        first = calls[0]
-        name = first.function.name
-        try:
-            args = json.loads(first.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        impl = self._impls.get(name)
-        result = impl(args) if impl else {"error": f"unknown tool {name}"}
-        # Append assistant tool call + tool result, ask for natural-language synthesis.
-        messages.append(
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": first.id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": first.function.arguments},
-                    }
-                ],
-            }
-        )
-        messages.append({"role": "tool", "tool_call_id": first.id, "content": json.dumps(result, default=str)})
+
+        MAX_STEPS = 5
+        for step in range(MAX_STEPS):
+            resp = self.client.chat(
+                messages=messages,
+                tools=self.schemas,
+                tool_choice="auto",
+                temperature=0.7 if step == 0 else 0.2,
+                timeout=120,
+            )
+            msg = resp.choices[0].message
+            calls = msg.tool_calls or []
+            if not calls:
+                fb = _parse_text_tool_call(msg.content or "", self.exposed_names)
+                if fb is None:
+                    return msg.content or ""
+                calls = [_synthesize_tool_call(*fb)]
+
+            first = calls[0]
+            name = first.function.name
+            try:
+                args = json.loads(first.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            impl = self._impls.get(name)
+            result = impl(args) if impl else {"error": f"unknown tool {name}"}
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": first.id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": first.function.arguments},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": first.id, "content": json.dumps(result, default=str)}
+            )
+
+        # Step budget exhausted — force a tool-free summary so the user
+        # gets *something* coherent instead of another dangling tool call.
         final = self.client.chat(messages=messages, temperature=0.2, timeout=120)
         return final.choices[0].message.content or ""
