@@ -1,10 +1,10 @@
 # Vertical-Domain Self-Evolving Knowledge Graph
 
-Northeastern ALY 6980 Capstone project. A knowledge graph system that evolves via periodic "sleep passes" — pruning, entity consolidation, weight reinforcement, and link formation — in order to surface *derived* knowledge that cannot be read off any single raw source, user contribution, or point in time.
+A vertical-domain knowledge graph that evolves autonomously via periodic "sleep passes" — pruning, entity consolidation, weight reinforcement, and link formation — to surface *derived* knowledge that cannot be read off any single raw source, user contribution, or point in time. The goal is a graph whose value grows after ingestion, not just during it.
 
 ## Status
 
-Early-stage scaffolding. Data not yet in; demo is the minimum end-to-end skeleton: ingest → graph → Q&A agent → online write → (stub) sleep pass → Streamlit chat.
+End-to-end skeleton in place: ingest → graph → Q&A agent → online write → sleep pass → Streamlit chat. Real-domain data validation is the next milestone.
 
 ## Architecture (brief)
 
@@ -48,22 +48,22 @@ Single-file dashboard at `src/dashboard/streamlit_app.py` wraps `GraphAgent` for
 
 Two modes via sidebar radio:
 
-- **Chat** — user message → `GraphAgent.call(msg, history)`. History is passed through a rolling token window (`HISTORY_BUDGET_TOKENS=3000`, per guide §12.5.2) so prompt size stays bounded no matter how long the session runs.
-- **Ingest sample** — pasted paragraph → `GraphInstance.integrate(...)`, which routes through M3's LLM-extract + classify + upsert. This is the path for guide §8's "人工在多次独立会话中分别粘入" behavior: each paste carries a fresh `turn_id` under one per-session `conversation_id`, so plant-and-recover evaluation can trace contributions per turn.
+- **Chat** — user message → `GraphAgent.call(msg, history)`. History is passed through a rolling token window (`HISTORY_BUDGET_TOKENS=3000`) so prompt size stays bounded no matter how long the session runs.
+- **Ingest sample** — pasted paragraph → `GraphInstance.integrate(...)`, which routes through M3's LLM-extract + classify + upsert. This is the path for manually pasting bridge fragments across multiple independent sessions: each paste carries a fresh `turn_id` under one per-session `conversation_id`, so plant-and-recover evaluation can trace contributions per turn.
 
 Instance selector switches between `data/experiment` (where the toy seed lives) and `data/production`; storage is persisted after every turn. While `sleep_pass_running` is set by M4, the top banner flips to a pause notice and the agent itself short-circuits new requests (Phase 6 lock).
 
 ## Phase 6 — Sleep pass (M4)
 
-The sleep pass is modeled as a LangGraph `StateGraph` over four sub-operations in the fixed order `4c → 4b → 4a → 4d` (guide §5). 4c is one-shot; 4b / 4a / 4d each live in a self-looping node that converges before the graph hands control to the next.
+The sleep pass is modeled as a LangGraph `StateGraph` over four sub-operations in the fixed order `4c → 4b → 4a → 4d`. 4c (weight reinforcement) is one-shot; 4b (merge), 4a (prune), and 4d (link formation) each live in a self-looping node that converges before the graph hands control to the next.
 
-Convergence rules (guide §5.0 + user direction):
+Convergence rules:
 
 - **4b merge** — after each round, a fresh-memory LLM explicitly votes `stop` or `continue`. Hard cap `MERGE_MAX_ITER=10`.
 - **4a prune** — mechanical: round with no new deletion → exit.
 - **4d link-form** — mechanical: round with no new passing edge → exit. Pairs judged once are remembered per-pass so we do not re-ask rejections.
 
-Candidate generation for 4b combines (a) embedding top-k (`sentence-transformers/all-MiniLM-L6-v2`, reused from M2 retrieval), (b) neighbor-set Jaccard ≥ 0.3, and (c) same-type-with-cos ≥ 0.55 as documented in §5.5 "同类型也进候选". 4d seeds are this pass's merges plus the top-decile reinforced nodes, BFS to depth 2. 4d strictly drops any pair where the LLM cannot state both *what* the relation is and *why* it holds (§5.7 critical rule).
+Candidate generation for 4b combines (a) embedding top-k (`sentence-transformers/all-MiniLM-L6-v2`, reused from M2 retrieval), (b) neighbor-set Jaccard ≥ 0.3, and (c) same-type-with-cos ≥ 0.55 (same-type pairs also qualify as candidates). 4d seeds are this pass's merges plus the top-decile reinforced nodes, BFS to depth 2. 4d strictly drops any pair where the LLM cannot state both *what* the relation is and *why* it holds.
 
 `trigger_sleep_pass` runs synchronously. While a pass is in flight the M2 agent rejects new requests with `"Sleep pass is currently running"` — by design, the consolidation is the centerpiece, not chat availability.
 
@@ -81,28 +81,28 @@ One full pass against the toy seed currently:
 
 ## Phase 5 — Tool-calling validation
 
-Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow the 2026-04-20 baseline at `F:\Master_CA\Python Test\test.py`.
+Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow an external baseline test harness.
 
 - **Round 1** — 9 tools exposed (read-only + evaluation). Write tools (`upsert_node`, `upsert_edge`) withheld on purpose; tier-9 "create a node" trap expects refusal. Strict rubric.
 - **Round 2** — all 11 tools exposed. Write-adjacent tier-9 cases use a lenient rubric that also accepts `graph_query` / `read_ontology` as preparatory check-before-write steps.
 
 | Tier | Round 1 (tool / param) | Round 2 (tool / param) |
 |---|---|---|
-| T1 基础 | 100% / 100% | 100% / 100% |
-| T2 多工具 | 100% / 100% | 100% / 100% |
-| T3 参数 | 100% / 100% | 100% / 100% |
-| T4 边界 | 100% / 100% | 100% / 100% |
-| T5 近义 | 100% / 100% | 100% / 100% |
-| T6 口语 | 100% / 100% | 100% / 100% |
-| T7 噪声 | 100% / 100% | 100% / 100% |
-| T8 多意图 | 100% / 100% | 100% / 100% |
-| T9 陷阱 | **95.0% / 95.0%** | **97.5% / 97.5%** |
-| T10 元意图 | 100% / 100% | 100% / 100% |
+| T1 Basic | 100% / 100% | 100% / 100% |
+| T2 Multi-tool | 100% / 100% | 100% / 100% |
+| T3 Parameter | 100% / 100% | 100% / 100% |
+| T4 Edge case | 100% / 100% | 100% / 100% |
+| T5 Synonym | 100% / 100% | 100% / 100% |
+| T6 Colloquial | 100% / 100% | 100% / 100% |
+| T7 Noise | 100% / 100% | 100% / 100% |
+| T8 Multi-intent | 100% / 100% | 100% / 100% |
+| T9 Trap | **95.0% / 95.0%** | **97.5% / 97.5%** |
+| T10 Meta-intent | 100% / 100% | 100% / 100% |
 
 Findings:
 
 1. **Exposing write tools did not pollute routing on other tiers** — T1–T8 and T10 stay at 100% in both rounds.
-2. **"Check-before-write" is a stable tendency**. In round 2, the "edit summary" prompt goes through `graph_query` 10/10 before attempting a write. Round 1 also shows 1/10 agents taking the same verify path even with no write tool available. This mirrors the verify-then-write pattern that M4 sleep pass uses under the LangGraph pass-within convergence loop (§5.0 option β).
+2. **"Check-before-write" is a stable tendency**. In round 2, the "edit summary" prompt goes through `graph_query` 10/10 before attempting a write. Round 1 also shows 1/10 agents taking the same verify path even with no write tool available. This mirrors the verify-then-write pattern that M4 sleep pass uses under its LangGraph convergence loop.
 3. **Write tools are not exposed to chat in production.** `upsert_node` / `upsert_edge` are driven by M4 sleep pass. The round-2 lenient rubric reflects this: a preparatory query is not a failure, it is the same pattern the sleep pass itself follows.
 
 Rerun:
@@ -114,4 +114,4 @@ python -m tests.test_tool_calling both   # or 1 / 2
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
