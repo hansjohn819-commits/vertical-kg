@@ -22,7 +22,7 @@ from pathlib import Path
 import streamlit as st
 
 from src.graph.instance import GraphInstance
-from src.graph.tokens import count_tokens
+from src.graph.tokens import INTEGRATE_INPUT_SOFT_CAP_TOKENS, count_tokens
 from src.modules.m2_qa_agent import GraphAgent
 from src.modules.m3_integrate import UserContext
 
@@ -149,6 +149,12 @@ def main() -> None:
                     f"{result.nodes_touched} node(s), "
                     f"{result.edges_added} edge(s) added."
                 )
+                if result.compressed:
+                    reply += (
+                        f"\n\n> ℹ️ Input was {result.original_tokens} tokens "
+                        f"(over the {INTEGRATE_INPUT_SOFT_CAP_TOKENS}-token soft cap); LLM-compressed to "
+                        f"{result.compressed_tokens} tokens before extraction."
+                    )
             except Exception as exc:
                 reply = f"Ingest failed: {exc}"
         st.markdown(reply)

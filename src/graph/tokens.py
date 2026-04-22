@@ -20,6 +20,11 @@ DETAIL_MAX_TOKENS = 8_000
 # Ingest input cap (guide §12.5.4 M1).
 INGEST_INPUT_MAX_TOKENS = 25_000
 
+# M3 integrate soft cap — online Streamlit paste path (guide §12.5.4 M3).
+# Over this, the integrator LLM-compresses the input before extraction
+# (guide §12.5.5 "agent 自压缩" direction). Not a hard reject.
+INTEGRATE_INPUT_SOFT_CAP_TOKENS = 8_000
+
 
 def count_tokens(text: str) -> int:
     return len(_ENC.encode(text))

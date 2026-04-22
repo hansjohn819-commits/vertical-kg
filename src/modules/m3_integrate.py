@@ -18,7 +18,11 @@ from pydantic import BaseModel
 
 from src.graph.models import Edge, Node, UserProv
 from src.graph.storage import GraphStorage
-from src.graph.tokens import SUMMARY_MAX_TOKENS, count_tokens
+from src.graph.tokens import (
+    INTEGRATE_INPUT_SOFT_CAP_TOKENS,
+    SUMMARY_MAX_TOKENS,
+    count_tokens,
+)
 from src.llm.routing import get_client
 
 Classification = Literal["experience", "supplement"]
@@ -134,6 +138,42 @@ class IntegrateResult:
     classification: Classification
     nodes_touched: int
     edges_added: int
+    # Compression metadata — populated when the input exceeded the soft cap
+    # and was LLM-compressed before extraction (guide §12.5.5).
+    compressed: bool = False
+    original_tokens: int | None = None
+    compressed_tokens: int | None = None
+
+
+COMPRESS_SYSTEM_PROMPT = """You compress long user statements before they are
+fed into a knowledge-graph extraction pipeline. Your ONLY job is to shorten
+the text while preserving ALL of:
+
+- every named entity (people, companies, products, locations, organizations)
+- every explicit relation between entities
+- dates, quantities, and numeric facts
+- causal / temporal qualifiers ("after", "because of", ...)
+
+Drop only: filler, rhetoric, repetition, background common sense, stylistic
+flourishes. Do NOT summarize in your own words — keep the original phrasing
+where possible. Output ONLY the compressed text, no preface.
+
+Target length: ≤ {target_tokens} tokens (approximate).
+"""
+
+
+def _compress_statement(statement: str, target_tokens: int) -> str:
+    """LLM-compress `statement` toward `target_tokens`. Best-effort — caller
+    must still handle the case where the result is still over cap."""
+    client = get_client("backend")
+    resp = client.chat(
+        messages=[
+            {"role": "system", "content": COMPRESS_SYSTEM_PROMPT.format(target_tokens=target_tokens)},
+            {"role": "user", "content": statement},
+        ],
+        temperature=0.1,
+    )
+    return (resp.choices[0].message.content or "").strip() or statement
 
 
 def _parse_json_loose(text: str) -> dict:
@@ -155,6 +195,19 @@ def integrate_user_statement(
     statement: str,
     user_ctx: UserContext,
 ) -> IntegrateResult:
+    original_tokens = count_tokens(statement)
+    compressed_flag = False
+    final_tokens: int | None = None
+    if original_tokens > INTEGRATE_INPUT_SOFT_CAP_TOKENS:
+        statement = _compress_statement(statement, INTEGRATE_INPUT_SOFT_CAP_TOKENS)
+        compressed_flag = True
+        final_tokens = count_tokens(statement)
+        # Safety net: if LLM compression failed to shrink it enough, hard-trim
+        # so downstream prompts still fit. Rare; keeps the soft-cap promise.
+        if final_tokens > INTEGRATE_INPUT_SOFT_CAP_TOKENS:
+            statement = statement[: INTEGRATE_INPUT_SOFT_CAP_TOKENS * 4]
+            final_tokens = count_tokens(statement)
+
     classification = classify_user_fact(statement)
     client = get_client("backend")
     resp = client.chat(
@@ -201,4 +254,7 @@ def integrate_user_statement(
         classification=classification,
         nodes_touched=len(label_to_node),
         edges_added=edges_added,
+        compressed=compressed_flag,
+        original_tokens=original_tokens,
+        compressed_tokens=final_tokens,
     )
