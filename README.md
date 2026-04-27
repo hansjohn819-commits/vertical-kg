@@ -76,7 +76,7 @@ One full pass against the toy seed currently:
 
 ## Tool-calling validation
 
-Two-round routing test over 35 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow an external baseline test harness.
+Two-round routing test over 10 prompts × 10 runs × temp=0.7 on `google/gemma-4-26b-a4b`, driven through the real `GraphAgent` (not a parallel tool array). Tiers follow an external baseline test harness.
 
 - **Round 1** — 9 tools exposed (read-only + evaluation). Write tools (`upsert_node`, `upsert_edge`) withheld on purpose; tier-9 "create a node" trap expects refusal. Strict rubric.
 - **Round 2** — all 11 tools exposed. Write-adjacent tier-9 cases use a lenient rubric that also accepts `graph_query` / `read_ontology` as preparatory check-before-write steps.
