@@ -17,13 +17,15 @@ SAFETY_FACTOR = 1.2
 SUMMARY_MAX_TOKENS = 300
 DETAIL_MAX_TOKENS = 8_000
 
-# Ingest input cap (guide §12.5.4 M1).
-INGEST_INPUT_MAX_TOKENS = 25_000
+# Ingest input cap (guide §12.5.4 M1). Sized for the 128K context window:
+# 80K tiktoken input × 1.2 safety ≈ 96K real input + ~10K extraction output
+# + ~1K prompt overhead ≈ 107K real, comfortably under 128K.
+INGEST_INPUT_MAX_TOKENS = 80_000
 
-# M3 integrate soft cap — online Streamlit paste path (guide §12.5.4 M3).
-# Over this, the integrator LLM-compresses the input before extraction
-# (guide §12.5.5 "agent 自压缩" direction). Not a hard reject.
-INTEGRATE_INPUT_SOFT_CAP_TOKENS = 8_000
+# PDF chunking overlap: each chunk after the first repeats this many pages
+# from the tail of the previous chunk so cross-page sentences and tables
+# aren't sliced (guide §12.5.5).
+INGEST_PDF_PAGE_OVERLAP = 2
 
 
 def count_tokens(text: str) -> int:

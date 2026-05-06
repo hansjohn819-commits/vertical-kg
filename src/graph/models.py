@@ -38,14 +38,6 @@ class DirectProv(BaseModel):
     extraction_run_id: str
 
 
-class UserProv(BaseModel):
-    kind: Literal["user"] = "user"
-    user_id: str
-    conversation_id: str
-    turn_id: str
-    classification: Literal["experience", "supplement"]
-
-
 class DerivedProv(BaseModel):
     kind: Literal["derived"] = "derived"
     operation_id: str
@@ -56,7 +48,7 @@ class DerivedProv(BaseModel):
 
 
 Provenance = Annotated[
-    Union[DirectProv, UserProv, DerivedProv],
+    Union[DirectProv, DerivedProv],
     Field(discriminator="kind"),
 ]
 

@@ -6,4 +6,5 @@ tiktoken>=0.8
 langgraph>=0.2
 sentence-transformers>=3.0
 streamlit>=1.40
+pdfplumber>=0.11
 pytest>=8.0

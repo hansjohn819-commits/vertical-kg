@@ -4,6 +4,8 @@ log.md
 data/raw/
 data/production/
 data/experiment/
+data/m1_failures/
+data/chats/
 results/
 
 # --- Secrets & env ---
@@ -29,6 +31,7 @@ env/
 # --- IDE / OS ---
 .vscode/
 .idea/
+.obsidian/
 *.swp
 .DS_Store
 Thumbs.db

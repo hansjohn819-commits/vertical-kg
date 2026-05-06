@@ -39,20 +39,6 @@ class GraphInstance:
         from src.modules.m2_qa_agent import GraphAgent
         return GraphAgent(self).call(question)
 
-    def integrate(
-        self,
-        statement: str,
-        user_id: str,
-        conversation_id: str,
-        turn_id: str,
-    ):
-        """M3: online write from chat."""
-        from src.modules.m3_integrate import UserContext, integrate_user_statement
-        ctx = UserContext(
-            user_id=user_id, conversation_id=conversation_id, turn_id=turn_id
-        )
-        return integrate_user_statement(self.storage, statement, ctx)
-
     def sleep_pass(self) -> dict:
         """M4: periodic maintenance (4c→4b→4a→4d)."""
         from src.modules.m4_sleep_pass.runner import run_sleep_pass
