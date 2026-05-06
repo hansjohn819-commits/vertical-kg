@@ -17,7 +17,7 @@ class LocalClient:
         model: str | None = None,
         context_tokens: int | None = None,
     ):
-        self.base_url = base_url or os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:1234/v1")
+        self.base_url = base_url or os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8080/v1")
         self.api_key = api_key or os.getenv("LOCAL_LLM_API_KEY", "not-needed")
         self.model = model or os.getenv("LOCAL_LLM_MODEL", "google/gemma-4-26b-a4b")
         # Input + output share this budget. See guide §12.5.
