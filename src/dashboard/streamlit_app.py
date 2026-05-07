@@ -227,7 +227,7 @@ def _render_chat_sidebar(store: ChatStore, role: str) -> None:
 
 def _render_chat_header(role: str, sleep_pass_running: bool) -> None:
     if role == ROLE_INTERNAL:
-        st.title("Kelp Industry Insights — Internal")
+        st.title("Seaweed Industry Insights — Internal")
         st.caption(
             "Research mode. Ask about the kelp / seaweed industry, drop a "
             "new report into data/raw/ and ask the analyst to ingest it, "
@@ -239,7 +239,7 @@ def _render_chat_header(role: str, sleep_pass_running: bool) -> None:
                 "until it finishes."
             )
     else:
-        st.title("Kelp Industry Insights")
+        st.title("Seaweed Industry Insights")
         st.caption(
             "Ask about the kelp / seaweed industry — trends, economics, "
             "players, ecology, technology."
@@ -328,7 +328,7 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
 # --- Main ------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Kelp Industry Insights", layout="wide")
+    st.set_page_config(page_title="Seaweed Industry Insights", layout="wide")
     gi = _load_instance()
     store = _load_chat_store()
 
