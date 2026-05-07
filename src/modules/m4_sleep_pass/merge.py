@@ -15,23 +15,26 @@ rounds elapse.
 
 import json
 import re
+from collections import defaultdict
 from uuid import uuid4
 
 import numpy as np
 
 from src.graph.instance import GraphInstance
 from src.graph.models import DerivedProv, Edge, Node, NodeRef
-from src.graph.retrieval import _get_model
+from src.graph.retrieval import encode_node
 from src.graph.storage import GraphStorage
 from src.graph.tokens import DETAIL_MAX_TOKENS, SUMMARY_MAX_TOKENS, count_tokens
+from src.graph.vector_store import VectorStore
 from src.llm.routing import get_client
 
 from .pass_log import log_event
 from .state import (
-    MERGE_COS_MIN,
-    MERGE_COS_SAME_TYPE,
+    MERGE_COS_FLOOR,
+    MERGE_COS_HIGH,
     MERGE_JACCARD_MIN,
     MERGE_MAX_ITER,
+    MERGE_PAIR_CAP_PER_ROUND,
     MERGE_TOP_K,
     PassState,
 )
@@ -91,14 +94,19 @@ def _active_nodes(storage: GraphStorage) -> list[Node]:
     return [n for n in storage.nodes() if n.merged_into is None]
 
 
-def _cleanup_prior_ghosts(storage: GraphStorage) -> int:
-    """Delete nodes carrying merged_into from a prior pass (§5.5 one-pass delay)."""
+def _cleanup_prior_ghosts(storage: GraphStorage, vector_store: VectorStore) -> int:
+    """Delete nodes carrying merged_into from a prior pass (§5.5 one-pass delay).
+
+    Vector-store removal is idempotent — the merge that produced the ghost
+    should have already removed it from the index, this is the safety net.
+    """
     ghosts = [n for n in storage.nodes() if n.merged_into is not None]
     removed = 0
     for g in ghosts:
         # Only drop ghosts with no incident edges (edges should have been
         # migrated during the merge that created them).
         if not storage.incident_edges(g.id):
+            vector_store.remove(g.id)  # idempotent
             storage.remove_node(g.id)
             removed += 1
     return removed
@@ -110,38 +118,111 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def _candidate_pairs(storage: GraphStorage) -> list[tuple[Node, Node, float]]:
-    """Return deduped (A, B, cos) candidate pairs passing top-k + filter."""
+def _candidate_pairs(
+    storage: GraphStorage, vector_store: VectorStore,
+) -> list[tuple[Node, Node, float]]:
+    """Return deduped (A, B, cos) candidate pairs from two paths.
+
+    Path 1 — FAISS top-K + filter (§16.10): each active node queries the
+    index for MERGE_TOP_K+1 nearest neighbors (+1 to drop self), then
+    filtered by cos/jac signals. Catches near-duplicate names AND
+    moderate-similarity pairs with structural confirmation.
+
+    Path 2 — same-label forced inclusion (2026-05-06 追加): nodes whose
+    `label.casefold().strip()` are equal go into the candidate pool
+    regardless of where they sit in vector space. Empirical reason:
+    same-label duplicates in this corpus often have cos 0.6-0.8 (different
+    docs describe the entity with different summary text) and jac=0
+    (graph not yet built up shared neighbors), so the FAISS top-K path
+    alone misses them. Same-label is itself a near-definitive identity
+    signal — cheaper to let LLM judge a few extra borderline cases (like
+    distinct people sharing a name) than to re-design the candidate
+    generation around acronyms / aliases.
+    """
     nodes = _active_nodes(storage)
     if len(nodes) < 2:
         return []
-    model = _get_model()
-    texts = [f"{n.type}: {n.label} — {n.summary}" for n in nodes]
-    embs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    sim = embs @ embs.T
-    np.fill_diagonal(sim, -1.0)
 
     neighbor_ids: dict[str, set[str]] = {
         n.id: {nb.id for nb in storage.neighbors(n.id)} for n in nodes
     }
+    by_id: dict[str, Node] = {n.id: n for n in nodes}
 
     seen: set[tuple[str, str]] = set()
     pairs: list[tuple[Node, Node, float]] = []
-    for i, a in enumerate(nodes):
-        top_idx = np.argsort(-sim[i])[: MERGE_TOP_K]
-        for j in top_idx:
-            if j == i or sim[i, j] < 0:
+    same_label_added = 0
+
+    # Path 1: FAISS top-K with cos/jac filter.
+    for a in nodes:
+        # +1 because the index contains `a` itself; self will be top-1 with
+        # cos=1 and we filter it out below.
+        hits = vector_store.query(encode_node(a), MERGE_TOP_K + 1)
+        for hit_id, cos in hits:
+            if hit_id == a.id:
                 continue
-            b = nodes[int(j)]
+            b = by_id.get(hit_id)
+            if b is None:  # vector store stale relative to active set
+                continue
             key = tuple(sorted([a.id, b.id]))
             if key in seen:
                 continue
-            cos = float(sim[i, j])
             jac = _jaccard(neighbor_ids[a.id], neighbor_ids[b.id])
-            same_type_match = a.type == b.type and cos >= MERGE_COS_SAME_TYPE
-            if cos >= MERGE_COS_MIN or jac >= MERGE_JACCARD_MIN or same_type_match:
+            # Branch 1: very high cos alone is sufficient (near-duplicate names).
+            # Branch 2: moderate cos AND structural confirmation (shared neighbors).
+            if cos >= MERGE_COS_HIGH or (cos >= MERGE_COS_FLOOR and jac >= MERGE_JACCARD_MIN):
                 seen.add(key)
                 pairs.append((a, b, cos))
+
+    # Path 2: same-label forced inclusion. Encode each node once, group by
+    # normalized label, compute pairwise cos for in-group pairs (used for
+    # sorting / cap; NOT for filtering — same-label is the qualifier here).
+    label_groups: dict[str, list[tuple[Node, np.ndarray]]] = defaultdict(list)
+    for n in nodes:
+        norm = n.label.strip().casefold()
+        if not norm:
+            continue
+        label_groups[norm].append((n, encode_node(n)))
+    for group in label_groups.values():
+        if len(group) < 2:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, va = group[i]
+                b, vb = group[j]
+                key = tuple(sorted([a.id, b.id]))
+                if key in seen:
+                    continue
+                cos = float(np.dot(va, vb))  # both already normalized
+                seen.add(key)
+                pairs.append((a, b, cos))
+                same_label_added += 1
+
+    if same_label_added:
+        log_event({
+            "kind": "merge_same_label_added",
+            "summary": f"forced {same_label_added} same-label pairs into candidate pool",
+            "count": same_label_added,
+        })
+
+    # §16.11 hard cap: prevent LLM-judge call count from blowing up on
+    # large graphs. After the OR-filter we rank by cos desc and keep the
+    # top-N; whatever's clipped lands in log.md so cap value is tunable
+    # against real data.
+    if len(pairs) > MERGE_PAIR_CAP_PER_ROUND:
+        pairs.sort(key=lambda p: p[2], reverse=True)
+        clipped = pairs[MERGE_PAIR_CAP_PER_ROUND:]
+        pairs = pairs[:MERGE_PAIR_CAP_PER_ROUND]
+        log_event({
+            "kind": "merge_pair_capped",
+            "summary": (
+                f"capped {len(clipped)} candidate pairs "
+                f"(kept {MERGE_PAIR_CAP_PER_ROUND})"
+            ),
+            "kept": MERGE_PAIR_CAP_PER_ROUND,
+            "dropped": len(clipped),
+            "min_cos_kept": pairs[-1][2],
+            "max_cos_dropped": clipped[0][2],
+        })
     return pairs
 
 
@@ -200,6 +281,7 @@ def _fuse(client, a: Node, b: Node) -> tuple[str, str]:
 
 def _execute_merge(
     storage: GraphStorage,
+    vector_store: VectorStore,
     a: Node,
     b: Node,
     fused_summary: str,
@@ -224,6 +306,13 @@ def _execute_merge(
         ),
     )
     storage.add_node(new_node)
+    # Index the fused node; drop originals from the index immediately so
+    # the next round / next chat retrieval can't return stale A or B.
+    # Storage still holds A and B (with merged_into set) one pass for
+    # provenance — that's a storage-level concern, not vector-level.
+    vector_store.add(new_node.id, encode_node(new_node))
+    vector_store.remove(a.id)
+    vector_store.remove(b.id)
 
     # Migrate edges from A and B to new_node, deduping by (src, tgt, type).
     incident = {e.id: e for e in storage.incident_edges(a.id) + storage.incident_edges(b.id)}
@@ -267,14 +356,17 @@ def _vote_done(client, round_summary: str) -> bool:
 
 def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
     storage = instance.storage
+    vector_store = instance.vector_store
     client = get_client("backend")
     pass_id = state.get("pass_id", "unknown")
     iter_idx = int(state.get("merge_iter", 0))
 
     if iter_idx == 0:
-        _cleanup_prior_ghosts(storage)
+        ghosts_removed = _cleanup_prior_ghosts(storage, vector_store)
+    else:
+        ghosts_removed = 0
 
-    pairs = _candidate_pairs(storage)
+    pairs = _candidate_pairs(storage, vector_store)
     merged_ids: list[str] = []
     verdicts = {"same": 0, "different": 0, "same_with_caveats": 0, "error": 0}
 
@@ -293,15 +385,27 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
 
         if verdict == "same":
             fused_summary, fused_detail = _fuse(client, a, b)
-            new_node = _execute_merge(storage, a, b, fused_summary, fused_detail, pass_id)
+            new_node = _execute_merge(
+                storage, vector_store, a, b, fused_summary, fused_detail, pass_id,
+            )
             merged_ids.append(new_node.id)
+            # §16.8.1: log the labels and the fused id so a later
+            # `list_recent_merges` query can answer "what got merged" even
+            # after the originals are ghost-cleaned next pass.
+            survivor, retired = (a, b) if a.weight >= b.weight else (b, a)
             log_event({
                 "kind": "merge",
                 "pass_id": pass_id,
                 "summary": f"{a.label} + {b.label} -> {new_node.label}",
                 "new_id": new_node.id,
+                "fused_label": new_node.label,
+                "survivor_id": survivor.id,
+                "survivor_label": survivor.label,
+                "retired_id": retired.id,
+                "retired_label": retired.label,
                 "inputs": [a.id, b.id],
                 "why": judgement.get("why", ""),
+                "evidence": judgement.get("why", ""),
             })
         elif verdict == "same_with_caveats":
             a.weight *= 0.9
@@ -322,6 +426,7 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
 
     stats = dict(state.get("stats") or {})
     stats["merge_total"] = int(stats.get("merge_total", 0)) + len(merged_ids)
+    stats["nodes_pruned_total"] = int(stats.get("nodes_pruned_total", 0)) + ghosts_removed
     stats[f"merge_round_{iter_idx}"] = {"merged": len(merged_ids), "candidates": len(pairs), **verdicts}
 
     log_event({

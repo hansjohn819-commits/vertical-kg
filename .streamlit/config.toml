@@ -1,0 +1,14 @@
+# Dashboard theme — Obsidian-like dark, unified across chat + audit pages.
+# See guide §16 audit page design (2026-05-06).
+
+[theme]
+base = "dark"
+primaryColor = "#7aa2f7"           # accent blue (links, buttons, highlights)
+backgroundColor = "#1a1b26"        # main canvas
+secondaryBackgroundColor = "#24283b"  # sidebar / cards
+textColor = "#c0caf5"              # primary text
+font = "sans serif"
+
+[server]
+runOnSave = false                  # avoid noisy auto-reruns while editing
+headless = true

@@ -32,15 +32,30 @@ def prune_step(state: PassState, *, instance: GraphInstance) -> dict:
             if e.suspicious:
                 e.suspicious_pass_count += 1
                 if e.suspicious_pass_count >= PRUNE_DELETE_AFTER:
+                    # §16.8.1: capture endpoint labels BEFORE removing the
+                    # edge — once the edge is gone, the only audit trail is
+                    # this log line. The 2026-04-21 hallucination episode
+                    # came from `list_recent_prunings` returning bare ids.
+                    src_node = storage.get_node(e.source_id)
+                    tgt_node = storage.get_node(e.target_id)
                     storage.remove_edge_by_id(e.id)
                     deleted += 1
                     log_event({
                         "kind": "prune",
                         "pass_id": pass_id,
-                        "summary": f"deleted edge {e.type} (weight={e.weight:.3f})",
+                        "summary": (
+                            f"deleted edge {e.type} "
+                            f"({src_node.label if src_node else e.source_id}"
+                            f" -> {tgt_node.label if tgt_node else e.target_id}, "
+                            f"weight={e.weight:.3f})"
+                        ),
                         "edge_id": e.id,
-                        "src": e.source_id,
-                        "tgt": e.target_id,
+                        "edge_type": e.type,
+                        "weight": round(e.weight, 4),
+                        "source_id": e.source_id,
+                        "source_label": src_node.label if src_node else None,
+                        "target_id": e.target_id,
+                        "target_label": tgt_node.label if tgt_node else None,
                     })
             else:
                 e.suspicious = True

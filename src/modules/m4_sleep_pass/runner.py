@@ -40,21 +40,46 @@ def run_sleep_pass(instance: GraphInstance) -> dict:
         # Bump recursion cap: merge(10) + prune(few) + link(few) + misc.
         final = app.invoke(initial, config={"recursion_limit": 100})
         instance.save()
-        log_event({
-            "kind": "pass_end",
-            "pass_id": pass_id,
-            "summary": f"merge={final['stats'].get('merge_total', 0)} "
-                       f"prune={final['stats'].get('prune_total', 0)} "
-                       f"link={final['stats'].get('link_total', 0)}",
-        })
-        return {
+        stats = final.get("stats", {})
+        # §16.8.2: fixed-key counter dict so the agent can't ignore non-zero
+        # fields. Round-level breakdowns stay under `stats` for tools that
+        # want them (list_recent_merges, list_recent_prunings).
+        merge_candidates_examined = sum(
+            v.get("candidates", 0)
+            for k, v in stats.items()
+            if k.startswith("merge_round_") and isinstance(v, dict)
+        )
+        link_candidates_examined = sum(
+            v.get("asked", 0)
+            for k, v in stats.items()
+            if k.startswith("link_round_") and isinstance(v, dict)
+        )
+        result = {
             "status": "ok",
             "pass_id": pass_id,
-            "stats": final.get("stats", {}),
+            "merges": int(stats.get("merge_total", 0)),
+            "edges_pruned": int(stats.get("prune_total", 0)),
+            "nodes_pruned": int(stats.get("nodes_pruned_total", 0)),
+            "new_links": int(stats.get("link_total", 0)),
+            "reinforced": int(stats.get("reinforce_edges_traversed", 0)),
+            "merge_candidates_examined": int(merge_candidates_examined),
+            "link_candidates_examined": int(link_candidates_examined),
+            # Iteration counts + raw stats for callers who need detail.
             "merge_iters": final.get("merge_iter", 0),
             "prune_iters": final.get("prune_iter", 0),
             "link_iters": final.get("link_iter", 0),
+            "stats": stats,
         }
+        log_event({
+            "kind": "pass_end",
+            "pass_id": pass_id,
+            "summary": (
+                f"merges={result['merges']} edges_pruned={result['edges_pruned']} "
+                f"nodes_pruned={result['nodes_pruned']} new_links={result['new_links']} "
+                f"reinforced={result['reinforced']}"
+            ),
+        })
+        return result
     finally:
         instance.sleep_pass_running = False
 

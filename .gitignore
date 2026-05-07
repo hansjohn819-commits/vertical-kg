@@ -5,7 +5,8 @@ data/raw/
 data/production/
 data/experiment/
 data/m1_failures/
-data/chats/
+data/chats.db
+data/snapshots/
 results/
 
 # --- Secrets & env ---

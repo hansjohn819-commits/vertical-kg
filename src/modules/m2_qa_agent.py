@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from src.graph.instance import GraphInstance
-from src.graph.retrieval import top_k, with_neighbors
+from src.graph.retrieval import display_title, top_k, with_neighbors
 from src.graph.tokens import (
     INGEST_INPUT_MAX_TOKENS,
     INGEST_PDF_PAGE_OVERLAP,
@@ -26,17 +26,49 @@ from src.graph.traversal_log import append_query
 from src.llm.routing import get_client
 
 SYSTEM_PROMPT = (
-    "You are an agent managing a knowledge graph. "
-    "Use the provided tools to answer the user's request. "
-    "Knowledge enters the graph in exactly one way: the user places a "
-    "document under data/raw/ and asks you to ingest it, in which case "
-    "you call `ingest_file`. You have NO ability to write nodes or edges "
-    "directly from chat; do not pretend otherwise. "
-    "If the user asks what files are available to ingest, call "
-    "`list_raw_files` — do not claim you cannot see the directory. "
-    "If a tool fits the request, call it. "
-    "If the user is just chatting and no tool is needed, reply in natural "
-    "language without calling any tool."
+    "You are a kelp / seaweed industry analyst. Your working memory holds an "
+    "evolving corpus of industry reports, scientific studies, and impact "
+    "assessments on the sector. When the user asks about the industry — "
+    "trends, economics, players, ecology, technology — answer as a domain "
+    "expert synthesizing that evidence. Speak in natural prose, not as a "
+    "system reading off a database; when you lean on a specific report, "
+    "weave the source into the sentence (\"according to the State of the "
+    "Kelp Industry Report...\") rather than citing internal IDs.\n\n"
+    "You have a tool box for retrieving evidence, running maintenance on "
+    "your working memory, and surfacing exact provenance when asked. Use "
+    "whichever tool fits the request. If the user is just chatting and no "
+    "tool is needed, reply in natural language.\n\n"
+    "Five hard rules — non-negotiable regardless of phrasing:\n"
+    "1. New evidence only enters your working memory when the user places a "
+    "document under data/raw/ and asks you to ingest it — call `ingest_file` "
+    "then. You CANNOT write facts directly from chat; do not pretend otherwise.\n"
+    "2. If the user asks what's available to ingest, call `list_raw_files` — "
+    "do not claim you cannot see the directory.\n"
+    "3. If the user pushes for exact provenance (\"where did you read this?\", "
+    "\"show me the source\"), call `show_provenance` and quote the raw "
+    "document rather than paraphrasing.\n"
+    "4. Be faithful to tool returns. When a tool's response does not contain "
+    "the field the user is asking about, say so plainly — \"the log does not "
+    "record that field\" or \"that tool doesn't expose this\" — and suggest a "
+    "question you can answer. NEVER invent labels, ids, weights, or other "
+    "values to fill a gap, even if the guess sounds reasonable.\n"
+    "5. Working memory is your ONLY source of industry knowledge. ANY "
+    "question about the kelp / seaweed industry — companies, products, "
+    "trends, economics, technology, geographies, people, regulations, "
+    "competitive landscape — MUST be answered from working memory only. "
+    "Mandatory flow: call `graph_query` first, then answer from that "
+    "evidence. If the evidence doesn't cover the specific question, say "
+    "plainly that working memory does not contain that information and "
+    "offer to ingest a relevant report. Do NOT fill gaps with information "
+    "from your prior training — the user cannot audit prior-training facts "
+    "via `show_provenance`, so they are indistinguishable from fabrication "
+    "and undermine the whole point of having a corpus. If you find yourself "
+    "\"knowing\" a fact (e.g. that company X is based in country Y) without "
+    "tracing it to a working-memory node, treat it as suspect: either "
+    "re-query with `graph_query` to confirm, or say you don't have that "
+    "information. Mixing prior-training claims with corpus claims in the "
+    "same answer — even when both happen to be true — is a hard violation, "
+    "because the user is reading them as one stream of grounded analysis."
 )
 
 # Budget for graph_query retrieval context (§12.5.2).
@@ -366,21 +398,38 @@ class GraphAgent:
     def _impl_graph_query(self, args: dict) -> dict:
         q = str(args.get("question", ""))
         storage = self.instance.storage
-        seeds = top_k(storage, q, k=5)
+        # Safety net: even when the agent's outer LLM has the full history
+        # in its messages, the question it passes via tool args may still
+        # be deictic ("中国呢"). Use a small dedicated rewrite call
+        # (thinking=False, ~1-2s) to produce a standalone retrieval query
+        # that includes both the conversation's topic anchor and the new
+        # entity. Same mechanism as fast_query — internal and external
+        # behave consistently on follow-ups.
+        history = getattr(self, "_turn_history", None) or []
+        seed_q = _rewrite_query_with_history(self.client, q, history)
+        seeds = top_k(self.instance.vector_store, storage, seed_q, k=5)
         nodes = with_neighbors(storage, seeds)
         # Budget summaries only, ≤20k tiktoken (§12.5).
         ctx_parts: list[str] = []
         tok = 0
         included_ids: set[str] = set()
         for n in nodes:
-            line = f"- [{n.type}] {n.label}: {n.summary}"
+            # Thread the source document into the evidence line so the
+            # answer composer can cite it inline ("according to the FAO
+            # SOFIA 2024 report...") instead of reading off node IDs.
+            src = ""
+            prov = getattr(n, "provenance", None)
+            rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
+            if rid:
+                src = f" (source: {rid})"
+            line = f"- [{n.type}] {n.label}: {n.summary}{src}"
             t = count_tokens(line)
             if tok + t > RETRIEVAL_BUDGET_TOKENS:
                 break
             ctx_parts.append(line)
             tok += t
             included_ids.add(n.id)
-        ctx = "\n".join(ctx_parts) or "(empty graph)"
+        ctx = "\n".join(ctx_parts) or "(no evidence in working memory yet)"
         # Log everything that made it into context — 4c uses this to reinforce.
         touched_edge_ids = [
             e.id for e in storage.edges()
@@ -395,8 +444,36 @@ class GraphAgent:
         )
         resp = self.client.chat(
             messages=[
-                {"role": "system", "content": "Answer the question from the graph context. Cite node labels in square brackets. If insufficient info, say so."},
-                {"role": "user", "content": f"GRAPH CONTEXT:\n{ctx}\n\nQUESTION: {q}"},
+                {"role": "system", "content": (
+                    "You are a kelp / seaweed industry analyst answering the "
+                    "user's question using the evidence below. Each evidence "
+                    "item lists the source document it came from. Write in "
+                    "natural prose the way an industry analyst would — when "
+                    "you draw on a specific report, weave the source into "
+                    "the sentence (e.g., \"according to the State of the "
+                    "Kelp Industry Report...\"). Drop the .pdf suffix and "
+                    "any #pages_... fragment when naming a source.\n\n"
+                    "Strict grounding rule: answer ONLY from the evidence "
+                    "below. Do NOT add facts you happen to know from prior "
+                    "training — even widely-known facts about companies, "
+                    "geographies, products, regulations. The caller will "
+                    "audit this answer against the source documents; "
+                    "anything you add beyond the evidence is fabrication "
+                    "to them. If the evidence is insufficient to answer "
+                    "the specific question asked, say so plainly and stop "
+                    "— do NOT pad with general knowledge to look helpful. "
+                    "Topic-mismatch case: when the caller's QUESTION is a "
+                    "follow-up that inherits a topic from prior turns "
+                    "(e.g., the conversation is about the kelp industry "
+                    "and the question is \"what about China?\"), evidence "
+                    "that mentions the new entity (China) in an "
+                    "off-topic context (e.g., general aquaculture or "
+                    "capture fisheries) is NOT sufficient — say plainly "
+                    "that the evidence doesn't cover the kelp industry "
+                    "for that entity. Do not silently pivot to the "
+                    "off-topic data."
+                )},
+                {"role": "user", "content": f"EVIDENCE:\n{ctx}\n\nQUESTION: {q}"},
             ],
             temperature=0.2,
         )
@@ -517,7 +594,22 @@ class GraphAgent:
                     )
                 }
             else:
-                return {"error": f"no such file: data/raw/{basename}"}
+                # Hand back the actual directory contents so the agent can
+                # pick a real name on the next turn rather than guessing
+                # again. Without this, "no such file: X" is a dead end —
+                # the model has no signal to recover from a wrong filename.
+                available = sorted(
+                    p.name for p in raw_dir.iterdir() if p.is_file()
+                )
+                return {
+                    "error": f"no such file: data/raw/{basename}",
+                    "available_files": available,
+                    "hint": (
+                        "filename must match exactly one entry in "
+                        "available_files; call list_raw_files first if "
+                        "you're unsure"
+                    ),
+                }
 
         ext = target.suffix.lower()
 
@@ -676,6 +768,10 @@ class GraphAgent:
         text-format fallbacks (see `_parse_text_tool_call`)."""
         if self.instance.sleep_pass_running:
             return "Sleep pass is currently running; chat is paused until it finishes."
+        # Stash for tool impls to enrich retrieval seeds with conversation
+        # context (see _impl_graph_query). Cleared after the call returns.
+        self._turn_history = history or []
+        self._turn_user_message = user_message
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
             messages.extend(history)
@@ -761,3 +857,361 @@ class GraphAgent:
                 result = impl(args)
                 return f"[{name}] {json.dumps(result, default=str, ensure_ascii=False)}"
         return _scrub_tool_call_markers(final_content)
+
+
+# ---------------------------------------------------------------------------
+# External fast-query path (§16.9.2 / §16.9.4 / §16.9.5)
+# ---------------------------------------------------------------------------
+#
+# External role gets:
+#   - top_k FAISS retrieval only (NO with_neighbors expansion — that's the
+#     internal "from-graph" superpower per §16.9 trade-off)
+#   - one composer LLM call with thinking=False
+#   - human-readable source titles via display_title (no raw filenames)
+#   - aggressive output scrub for any path / extension / tool-name /
+#     UUID / internal jargon that leaks despite the prompt rules
+#
+# The agent loop is bypassed entirely. No tools are exposed to external
+# users — the module deliberately doesn't construct a GraphAgent at all
+# in external mode (Streamlit calls fast_query directly).
+
+EXTERNAL_COMPOSER_SYSTEM_PROMPT = (
+    "You are a kelp / seaweed industry analyst answering the user's "
+    "question using the evidence below. Each evidence item lists the "
+    "source it came from. Write in natural prose the way an industry "
+    "analyst would — when you draw on a specific report, weave the "
+    "source into the sentence (e.g., \"according to the State of the "
+    "Kelp Industry Report\"). \n\n"
+    "Hard rules — never violate:\n"
+    "1. Do NOT mention file paths, file names, file extensions, internal "
+    "IDs (UUIDs, hashes), or any tool / function name. The user does not "
+    "have access to any backend tooling.\n"
+    "2. When citing a source, use only its human-readable title (already "
+    "provided in the evidence as `source: <title>`). Never include `.pdf` "
+    "or technical fragments like `#pages_X_Y`.\n"
+    "3. If the user asks about ingestion, indexing, maintenance, system "
+    "internals, or anything outside of industry knowledge, reply: \"I "
+    "don't have information on that.\" Do NOT acknowledge that any such "
+    "functionality exists or might exist.\n"
+    "4. If the evidence does not contain enough information to answer, "
+    "decline briefly in the voice of an expert who simply doesn't track "
+    "that topic — e.g., \"I don't have specific data on that\" or \"that's "
+    "outside what I follow.\" Then STOP. Do NOT speculate. Do NOT direct "
+    "the user to \"ask again later\" or \"contact an admin.\" Critically: "
+    "do NOT enumerate what topics, regions, or reports your information "
+    "DOES cover — phrasings like \"我所掌握的资料主要集中在...\", \"我的"
+    "现有资料覆盖...\", \"my information mainly focuses on...\", \"my "
+    "evidence covers X but not Y\" reveal that you are reading from a "
+    "curated database. A domain expert just declines and stops.\n"
+    "    Topic-mismatch case: when judging \"enough information,\" judge "
+    "against what the user is asking IN CONVERSATION CONTEXT, not just "
+    "the literal current message. If the conversation has been about the "
+    "kelp / seaweed industry and the user asks a deictic follow-up like "
+    "\"中国呢\" / \"what about China?\" / \"那美国呢\", they're asking "
+    "about THAT TOPIC for the new entity (China's kelp industry, US's "
+    "kelp industry). If your evidence has data about China in a different "
+    "context (e.g., general aquaculture, capture fisheries) but nothing "
+    "kelp-specific, that is a topic mismatch — DECLINE rather than pivot "
+    "silently to the off-topic data. The user reads every reply as a "
+    "continuation of the same thread and will infer the off-topic answer "
+    "is on-topic. Honest decline: \"I don't have specific information on "
+    "China's kelp industry\" — and stop.\n"
+    "5. You are a person — an analyst — not a system. Never refer to your "
+    "knowledge as \"my corpus\", \"my materials\", \"my information\", "
+    "\"my evidence\", \"my data\", \"the documents I have access to\", "
+    "\"我的资料\", \"我的知识库\", \"现有资料\", or anything similar. "
+    "If you must explain a limit, use language an industry analyst would "
+    "use about their own expertise (\"I don't track that closely\", "
+    "\"that's outside my coverage area\").\n"
+    "6. Answer ONLY from the evidence provided below. Do NOT add facts "
+    "you happen to know from prior training — not even widely-known ones "
+    "(company headquarters, product launches, regulatory dates, "
+    "geographic facts about countries / regions). The user has no way "
+    "to audit prior-training claims, so they are indistinguishable from "
+    "fabrication. Mixing prior-training facts with evidence-grounded "
+    "facts in the same answer is a hard violation, even when both are "
+    "true: the user reads them as one stream and cannot tell which is "
+    "which. If evidence covers part of the question and not the rest, "
+    "answer the covered part using evidence and decline the rest "
+    "(rule 4) — do NOT pad."
+)
+
+# Bare regex patterns for output scrub — final safety net if the LLM
+# violates a Hard Rule despite the system prompt.
+_SCRUB_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Project paths
+    (re.compile(r"\bdata/(raw|production|experiment|m1_failures|snapshots)/?\b", re.I), "(unspecified source)"),
+    # File extensions glued to a word (PDF / TXT / MD)
+    (re.compile(r"(\w)\.(pdf|txt|md|markdown)\b", re.I), r"\1"),
+    # Chunk fragment
+    (re.compile(r"#pages_\d+_\d+", re.I), ""),
+    # Tool / impl names
+    (re.compile(
+        r"\b(ingest_file|list_raw_files|trigger_sleep_pass|show_provenance|"
+        r"mark_stale|read_ontology|graph_query|get_graph_stats|"
+        r"list_recent_(?:merges|prunings)|run_plant_recover_eval|"
+        r"compare_with_baseline)\b", re.I,
+    ), "the system"),
+    # UUIDs (8-4-4-4-12 hex)
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), ""),
+    # Internal jargon
+    (re.compile(r"\b(raw_doc_id|provenance|sleep[ -]?pass|merge candidate|fused node|extraction_run_id)\b", re.I), ""),
+]
+
+
+# Sentences that betray "I'm reading from a curated corpus" — observed
+# 2026-05-06 in external chat: when LLM declined ("I don't know about US"),
+# it tacked on "我的资料主要集中在中国 / 全球渔业 / 北美海藻产业" which
+# IS a corpus enumeration. The rules in EXTERNAL_COMPOSER_SYSTEM_PROMPT
+# now forbid this, but Gemma 4 still slips. These regexes match the entire
+# offending sentence (until period / Chinese full stop / line break / end)
+# and delete it cleanly so the polite decline survives.
+_CORPUS_ENUMERATION_PATTERNS: list[re.Pattern] = [
+    # Chinese — "我所掌握的资料主要集中在...", "我的现有资料覆盖...",
+    # "我能找到的信息主要是...", "我的知识库..."
+    # Sentence boundary uses Chinese full stop 。 / 、(no, 、 is comma)
+    # / newline ONLY — embedded English abbreviation periods like "Inc."
+    # must NOT terminate the match. Comma 。 is NOT 。 (comma vs period).
+    re.compile(
+        r"我[的所]?(掌握|现有|可获取|拥有|能找到|目前)的?(资料|信息|数据|知识|文献|文档|材料|内容)"
+        r"[^。\n]*[。\n]?",
+    ),
+    re.compile(r"我的(知识库|资料库|信息库|数据库)[^。\n]*[。\n]?"),
+    re.compile(r"现有(的)?(资料|信息|数据)[^。\n]*[。\n]?"),
+    # English — "my materials/corpus/information/evidence/data
+    # mainly|primarily|focus|cover|are about ..."
+    # English sentence terminator: . ! ? followed by whitespace/EOL, OR
+    # newline. Bare "." inside abbreviations like "U.S." won't match
+    # because they're not followed by whitespace.
+    re.compile(
+        r"\b(my|the)\s+(materials?|corpus|information|knowledge\s*base|"
+        r"evidence|data|documents?|sources?|records?)\s+"
+        r"(mainly|primarily|chiefly|cover|covers|focus(?:es)?|"
+        r"are\s+about|is\s+about|center|centers?|"
+        r"contain|contains|include|includes)"
+        r"[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
+        re.I,
+    ),
+    # English — "the materials I have access to mainly focus on..."
+    re.compile(
+        r"\bthe\s+(materials?|information|evidence|data|documents?)\s+"
+        r"I\s+(have|can)\s+access(\s+to)?[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
+        re.I,
+    ),
+    # English — "what I have access to ..."
+    re.compile(
+        r"\bwhat\s+I\s+(have|can)\s+(access|find|see|tell)"
+        r"[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
+        re.I,
+    ),
+]
+
+
+def _strip_corpus_enumerations(text: str) -> str:
+    """Remove sentences that enumerate corpus contents. Order-dependent
+    with the main scrub: this runs first so the regex sees the original
+    LLM output (path / tool-name scrubs would otherwise damage the
+    trigger phrases before this runs)."""
+    cleaned = text or ""
+    for pattern in _CORPUS_ENUMERATION_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
+
+
+def _scrub_external_output(text: str) -> str:
+    """Apply the safety-net scrub to text destined for an external user.
+
+    Only run on external mode — internal users see the raw output for
+    debugging purposes. Multiple-substitution loop handles cases where
+    the first pass leaves residue that a later pattern cleans up.
+
+    Order matters: corpus-enumeration patterns run first because they
+    target full sentences that other (token-level) scrubs would damage.
+    """
+    cleaned = text or ""
+    cleaned = _strip_corpus_enumerations(cleaned)
+    for pattern, replacement in _SCRUB_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+    # Collapse any runs of whitespace introduced by removals.
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" +([,.;:!?])", r"\1", cleaned)
+    # Empty paragraphs left behind by sentence deletion.
+    cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+_REWRITE_SYSTEM_PROMPT = (
+    "You are a query-rewrite helper for a retrieval-augmented chat. "
+    "Given a multi-turn conversation history and a follow-up question, "
+    "produce a SINGLE standalone retrieval query that captures both "
+    "(a) the conversation's topic anchor and (b) what the follow-up "
+    "is now asking about. The output will be embedded and matched "
+    "against a corpus of industry document fragments — your job is to "
+    "make sure both the topic and the new entity/intent appear in the "
+    "query string.\n\n"
+    "Examples:\n"
+    "  HISTORY: user asks about kelp industry distribution in the "
+    "Americas; assistant answers about Maine, Washington, Alaska.\n"
+    "  FOLLOW-UP: \"中国呢\"\n"
+    "  STANDALONE: China kelp industry distribution\n\n"
+    "  HISTORY: user asks about FAO sustainability initiatives; "
+    "assistant lists Blue Transformation.\n"
+    "  FOLLOW-UP: \"那欧盟呢？\"\n"
+    "  STANDALONE: EU sustainability initiatives in fisheries\n\n"
+    "  HISTORY: (empty)\n"
+    "  FOLLOW-UP: \"What is sugar kelp?\"\n"
+    "  STANDALONE: What is sugar kelp\n\n"
+    "Rules:\n"
+    "- Output ONLY the standalone query as a single line. No quotes, "
+    "no \"Standalone:\" preamble, no explanation, no markdown.\n"
+    "- If the follow-up is already standalone, echo it verbatim.\n"
+    "- Keep the query under 30 words. Mix English and the user's "
+    "language as appropriate for retrieval matching."
+)
+
+_REWRITE_OUTPUT_MAX_CHARS = 400
+
+
+def _rewrite_query_with_history(
+    client, question: str, history: list[dict] | None,
+) -> str:
+    """Ask the LLM to rewrite the user's follow-up as a standalone
+    retrieval query, given the conversation so far.
+
+    Replaces the earlier string-concat heuristic. With thinking=False
+    the call is ~1-2s and produces semantically richer seeds — e.g.
+    "中国呢" with kelp-industry history rewrites to
+    "China kelp industry distribution", which embeds far closer to
+    the actual corpus content than naive concatenation.
+
+    Failures (LLM error, suspicious output, empty result) fall back
+    to the raw question — retrieval will be weaker but the chat
+    continues.
+    """
+    if not history:
+        return question
+    snapshot_lines: list[str] = []
+    for m in history[-10:]:  # cap context — rewrite doesn't need full history
+        role = m.get("role")
+        content = str(m.get("content", "")).strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        # Truncate any single turn so a long assistant essay doesn't
+        # dominate the rewrite prompt budget.
+        if len(content) > 400:
+            content = content[:400] + "…"
+        snapshot_lines.append(f"{role.upper()}: {content}")
+    if not snapshot_lines:
+        return question
+
+    user_msg = (
+        "CONVERSATION HISTORY:\n"
+        + "\n".join(snapshot_lines)
+        + f"\n\nFOLLOW-UP: {question}\n\nSTANDALONE:"
+    )
+    try:
+        resp = client.chat(
+            messages=[
+                {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            thinking=False,  # ~1-2s; rewrite is a low-creativity task
+            timeout=30,
+        )
+        rewritten = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return question
+
+    if not rewritten or len(rewritten) > _REWRITE_OUTPUT_MAX_CHARS:
+        return question
+    # Strip common preamble accidents ("Standalone:", quotes, etc.)
+    rewritten = rewritten.lstrip("\"'`「『 ").rstrip("\"'`」』 ")
+    for prefix in ("STANDALONE:", "Standalone:", "Query:", "查询:", "标准查询:"):
+        if rewritten.upper().startswith(prefix.upper()):
+            rewritten = rewritten[len(prefix):].strip()
+    return rewritten or question
+
+
+def fast_query(
+    instance: GraphInstance,
+    question: str,
+    *,
+    mode: str = "external",
+    history: list[dict] | None = None,
+) -> str:
+    """Single-call retrieval+composer path for external users (§16.9.2).
+
+    No agent loop, no tools, no neighbor expansion. `history` is the
+    rolling conversation window (already token-bounded by the caller via
+    `_windowed_history`). Two uses:
+      1. Seed enrichment — current question + last user turns are fed
+         to the embedding model so follow-ups like "中国呢" still find
+         the right nodes.
+      2. LLM context — full history is included in the composer call so
+         the model can resolve deictic references and follow the
+         conversation thread, just like internal mode does.
+
+    Returns the answer text scrubbed for external safety.
+    """
+    storage = instance.storage
+    client = get_client("backend")
+    # LLM-based query rewrite (§16 retrieval seed C-option, 2026-05-06):
+    # ask the model to fold history + follow-up into a standalone query.
+    # ~1-2s with thinking=False; falls back to raw question on failure.
+    seed_query = _rewrite_query_with_history(client, question, history)
+    seeds = top_k(instance.vector_store, storage, seed_query, k=5)
+    # External path INTENTIONALLY omits with_neighbors — vector retrieval
+    # only, no graph traversal. See §16.9.2 design table.
+
+    ctx_parts: list[str] = []
+    tok = 0
+    included_ids: set[str] = set()
+    for n in seeds:
+        prov = getattr(n, "provenance", None)
+        rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
+        # Use human title in evidence so the LLM never sees the raw filename.
+        title = display_title(rid) if rid else None
+        src = f" (source: {title})" if title else ""
+        line = f"- [{n.type}] {n.label}: {n.summary}{src}"
+        t = count_tokens(line)
+        if tok + t > RETRIEVAL_BUDGET_TOKENS:
+            break
+        ctx_parts.append(line)
+        tok += t
+        included_ids.add(n.id)
+    ctx = "\n".join(ctx_parts) or "(no evidence)"
+
+    # Reinforce traversal log even for external — these are real queries
+    # that should bump weights on touched nodes/edges in the next pass.
+    touched_edge_ids = [
+        e.id for e in storage.edges()
+        if e.source_id in included_ids and e.target_id in included_ids
+    ]
+    append_query(
+        storage,
+        question=question,
+        seed_node_ids=[n.id for n in seeds],
+        touched_node_ids=sorted(included_ids),
+        touched_edge_ids=touched_edge_ids,
+    )
+
+    composer_messages: list[dict] = [
+        {"role": "system", "content": EXTERNAL_COMPOSER_SYSTEM_PROMPT},
+    ]
+    if history:
+        composer_messages.extend(history)
+    composer_messages.append(
+        {"role": "user", "content": f"EVIDENCE:\n{ctx}\n\nQUESTION: {question}"},
+    )
+
+    resp = client.chat(
+        messages=composer_messages,
+        temperature=0.2,
+        thinking=False,  # ~15× speedup for external; accuracy matters less than latency
+    )
+    raw = resp.choices[0].message.content or ""
+
+    if mode == "external":
+        return _scrub_external_output(raw) or "I don't have information on that."
+    return raw

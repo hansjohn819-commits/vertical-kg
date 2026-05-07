@@ -84,6 +84,30 @@ class GraphStorage:
         ids = set(self._g.successors(node_id)) | set(self._g.predecessors(node_id))
         return [n for n in (self.get_node(i) for i in ids) if n is not None]
 
+    def degree(self, node_id: str) -> int:
+        """Total degree (in + out). Used by link_form bridge detection."""
+        if node_id not in self._g:
+            return 0
+        return self._g.in_degree(node_id) + self._g.out_degree(node_id)
+
+    def edge_types_between(self, u: str, v: str) -> list[str]:
+        """Edge types connecting `u` and `v` in either direction.
+
+        MultiDiGraph can have multiple edges between the same pair —
+        return all of their types. Used by link_form to inspect the
+        edges of a BFS path for the containment-pattern check.
+        """
+        types: list[str] = []
+        for src, dst in ((u, v), (v, u)):
+            edge_data = self._g.get_edge_data(src, dst)
+            if edge_data is None:
+                continue
+            for _key, attrs in edge_data.items():
+                data = attrs.get("data")
+                if data is not None:
+                    types.append(data.type)
+        return types
+
     # --- Persistence ---
 
     def save(self) -> None:
