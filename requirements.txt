@@ -6,6 +6,6 @@ tiktoken>=0.8
 langgraph>=0.2
 sentence-transformers>=3.0
 faiss-cpu>=1.8
-streamlit>=1.40
+streamlit>=1.41
 pdfplumber>=0.11
 pytest>=8.0

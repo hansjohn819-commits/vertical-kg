@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from src.graph.instance import GraphInstance
 from src.graph.retrieval import display_title, top_k, with_neighbors
@@ -23,6 +23,7 @@ from src.graph.tokens import (
     count_tokens,
 )
 from src.graph.traversal_log import append_query
+from src.llm.local_client import StreamEvent
 from src.llm.routing import get_client
 
 SYSTEM_PROMPT = (
@@ -858,6 +859,132 @@ class GraphAgent:
                 return f"[{name}] {json.dumps(result, default=str, ensure_ascii=False)}"
         return _scrub_tool_call_markers(final_content)
 
+    # -- streaming variant (§16.15.2) ------------------------------------
+
+    _TOOL_STATUS_MAP: dict[str, str] = {
+        "graph_query": "Searching the knowledge graph…",
+        "get_graph_stats": "Checking graph statistics…",
+        "show_provenance": "Looking up source information…",
+        "list_recent_merges": "Reviewing recent changes…",
+        "list_recent_prunings": "Reviewing recent changes…",
+        "list_raw_files": "Checking available documents…",
+        "ingest_file": "Processing document…",
+        "trigger_sleep_pass": "Running maintenance cycle…",
+        "read_ontology": "Reading domain schema…",
+        "run_plant_recover_eval": "Running evaluation…",
+        "compare_with_baseline": "Running baseline comparison…",
+    }
+
+    def stream_call(
+        self,
+        user_message: str,
+        history: list[dict] | None = None,
+    ) -> Iterator[str | dict]:
+        """Streaming variant of :meth:`call` (§16.15.2).
+
+        Yields a mix of:
+          - ``{"status": "…"}`` — status updates for the UI.
+          - ``str`` — content tokens of the final natural-language reply.
+
+        Tool-loop intermediate steps use synchronous ``client.chat()``.
+        The final reply is streamed token-by-token via
+        ``client.chat_stream()``.
+        """
+        if self.instance.sleep_pass_running:
+            yield "Sleep pass is currently running; chat is paused until it finishes."
+            return
+
+        self._turn_history = history or []
+        self._turn_user_message = user_message
+        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        last_signature: tuple[str, str] | None = None
+        duplicate_streak = 0
+
+        for step in range(AGENT_MAX_TOOL_STEPS):
+            yield {"status": "Thinking…"}
+
+            resp = self.client.chat(
+                messages=messages,
+                tools=self.schemas,
+                tool_choice="auto",
+                temperature=0.2,
+                timeout=120,
+            )
+            msg = resp.choices[0].message
+            calls = msg.tool_calls or []
+            if not calls:
+                fb = _parse_text_tool_call(msg.content or "", self.exposed_names)
+                if fb is None:
+                    break
+                calls = [_synthesize_tool_call(*fb)]
+
+            first = calls[0]
+            name = first.function.name
+            raw_args = first.function.arguments or "{}"
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+
+            signature = (name, raw_args)
+            if signature == last_signature:
+                duplicate_streak += 1
+                if duplicate_streak >= AGENT_DUPLICATE_CALL_LIMIT:
+                    yield (
+                        f"Stopped: model called `{name}` with the same "
+                        f"arguments {duplicate_streak + 1} times in a row "
+                        f"and isn't making progress."
+                    )
+                    return
+            else:
+                duplicate_streak = 0
+            last_signature = signature
+
+            yield {"status": self._TOOL_STATUS_MAP.get(name, "Working…")}
+
+            impl = self._impls.get(name)
+            result = impl(args) if impl else {"error": f"unknown tool {name}"}
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": first.id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": raw_args},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": first.id, "content": json.dumps(result, default=str)}
+            )
+        else:
+            # Step budget exhausted — stream a tool-free summary.
+            yield {"status": "Composing answer…"}
+            for event in self.client.chat_stream(
+                messages=messages, temperature=0.2, timeout=120,
+            ):
+                if event.token:
+                    yield event.token
+            return
+
+        # Stream the final reply (the loop broke because the model had no
+        # tool calls).  Re-issue as a streaming call WITHOUT tools so the
+        # model produces a clean natural-language reply.  Tokens are yielded
+        # raw — scrubbing individual tokens destroys whitespace.
+        yield {"status": "Composing answer…"}
+        for event in self.client.chat_stream(
+            messages=messages, temperature=0.2, timeout=120,
+        ):
+            if event.token:
+                yield event.token
+
 
 # ---------------------------------------------------------------------------
 # External fast-query path (§16.9.2 / §16.9.4 / §16.9.5)
@@ -1215,3 +1342,113 @@ def fast_query(
     if mode == "external":
         return _scrub_external_output(raw) or "I don't have information on that."
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Buffered streaming scrub (§16.15.3)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s|(?<=\n)")
+
+_FLUSH_BUFFER_LIMIT = 200
+
+
+def _buffered_scrub_stream(token_iter: Iterator[str]) -> Iterator[str]:
+    """Scrub streaming tokens through ``_scrub_external_output`` at sentence
+    boundaries.  Yields cleaned sentence chunks as they complete.
+
+    Tokens accumulate in a buffer.  When a sentence boundary is detected the
+    completed portion is scrubbed and yielded.  A hard limit flushes the
+    buffer even without a boundary (unlikely but safe).
+    """
+    buf = ""
+    for token in token_iter:
+        buf += token
+        while True:
+            m = _SENTENCE_BOUNDARY.search(buf)
+            if m is None:
+                if len(buf) >= _FLUSH_BUFFER_LIMIT:
+                    cleaned = _scrub_external_output(buf)
+                    if cleaned:
+                        yield cleaned
+                    buf = ""
+                break
+            sentence = buf[: m.end()]
+            buf = buf[m.end() :]
+            cleaned = _scrub_external_output(sentence)
+            if cleaned:
+                yield cleaned
+    if buf:
+        cleaned = _scrub_external_output(buf)
+        if cleaned:
+            yield cleaned
+
+
+def fast_query_stream(
+    instance: GraphInstance,
+    question: str,
+    *,
+    mode: str = "external",
+    history: list[dict] | None = None,
+) -> Iterator[str]:
+    """Streaming variant of :meth:`fast_query` (§16.15.3).
+
+    Retrieval and evidence assembly happen synchronously (fast — no LLM),
+    then the composer call streams through the buffered scrub.
+    """
+    storage = instance.storage
+    client = get_client("backend")
+    seed_query = _rewrite_query_with_history(client, question, history)
+    seeds = top_k(instance.vector_store, storage, seed_query, k=5)
+
+    ctx_parts: list[str] = []
+    tok = 0
+    included_ids: set[str] = set()
+    for n in seeds:
+        prov = getattr(n, "provenance", None)
+        rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
+        title = display_title(rid) if rid else None
+        src = f" (source: {title})" if title else ""
+        line = f"- [{n.type}] {n.label}: {n.summary}{src}"
+        t = count_tokens(line)
+        if tok + t > RETRIEVAL_BUDGET_TOKENS:
+            break
+        ctx_parts.append(line)
+        tok += t
+        included_ids.add(n.id)
+    ctx = "\n".join(ctx_parts) or "(no evidence)"
+
+    touched_edge_ids = [
+        e.id for e in storage.edges()
+        if e.source_id in included_ids and e.target_id in included_ids
+    ]
+    append_query(
+        storage,
+        question=question,
+        seed_node_ids=[n.id for n in seeds],
+        touched_node_ids=sorted(included_ids),
+        touched_edge_ids=touched_edge_ids,
+    )
+
+    composer_messages: list[dict] = [
+        {"role": "system", "content": EXTERNAL_COMPOSER_SYSTEM_PROMPT},
+    ]
+    if history:
+        composer_messages.extend(history)
+    composer_messages.append(
+        {"role": "user", "content": f"EVIDENCE:\n{ctx}\n\nQUESTION: {question}"},
+    )
+
+    def _raw_tokens() -> Iterator[str]:
+        for event in client.chat_stream(
+            messages=composer_messages,
+            temperature=0.2,
+            thinking=False,
+        ):
+            if event.token:
+                yield event.token
+
+    if mode == "external":
+        yield from _buffered_scrub_stream(_raw_tokens())
+    else:
+        yield from _raw_tokens()

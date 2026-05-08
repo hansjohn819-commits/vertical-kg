@@ -24,6 +24,7 @@ if str(_WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.dashboard.audit_view import render_audit_view
 from src.dashboard.chat_store import (
@@ -35,7 +36,9 @@ from src.dashboard.chat_store import (
 )
 from src.graph.instance import GraphInstance
 from src.graph.tokens import count_tokens
-from src.modules.m2_qa_agent import GraphAgent, fast_query
+import time
+
+from src.modules.m2_qa_agent import GraphAgent, fast_query, fast_query_stream
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 INSTANCE_DIR = WORKSPACE / "data" / "production"
@@ -91,6 +94,58 @@ _HIDE_DEFAULT_NAV_CSS = """
   div[data-testid="stHorizontalBlock"]:first-of-type button[kind] {
     font-weight: 600;
     letter-spacing: 0.02em;
+  }
+  /* Chat message body — larger text for readability (§16.14) */
+  div[data-testid="stChatMessage"] p,
+  div[data-testid="stChatMessage"] li,
+  div[data-testid="stChatMessage"] div {
+    font-size: 1.05rem !important;
+    line-height: 1.6 !important;
+  }
+  /* Chat input textarea */
+  div[data-testid="stChatInput"] textarea {
+    font-size: 1.05rem !important;
+  }
+  /* Response timer (§16.15.4) — !important to win over the generic
+     stChatMessage div rule above. Fixed px height matches the live
+     iframe timer so the visual position doesn't shift on freeze. */
+  .response-timer,
+  div[data-testid="stChatMessage"] .response-timer {
+    color: #888 !important;
+    font-size: 14px !important;
+    line-height: 24px !important;
+    height: 24px !important;
+    margin: 0 0 4px 0 !important;
+    padding: 0 !important;
+    font-variant-numeric: tabular-nums !important;
+  }
+  /* Animated status dots (cycle empty → "." → ".." → "..." every 4s) */
+  div[data-testid="stChatMessage"] .agent-status,
+  .agent-status {
+    color: #888 !important;
+    font-style: italic !important;
+    font-size: 1rem !important;
+    line-height: 1.5 !important;
+  }
+  /* Three discrete dot spans, each with its own visibility keyframe. */
+  .agent-status .d {
+    opacity: 0;
+    display: inline !important;
+  }
+  .agent-status .d1 { animation: agent-blink1 4s infinite; }
+  .agent-status .d2 { animation: agent-blink2 4s infinite; }
+  .agent-status .d3 { animation: agent-blink3 4s infinite; }
+  @keyframes agent-blink1 {
+    0%, 24.9% { opacity: 0; }
+    25%, 100% { opacity: 1; }
+  }
+  @keyframes agent-blink2 {
+    0%, 49.9% { opacity: 0; }
+    50%, 100% { opacity: 1; }
+  }
+  @keyframes agent-blink3 {
+    0%, 74.9% { opacity: 0; }
+    75%, 100% { opacity: 1; }
   }
 </style>
 """
@@ -252,32 +307,95 @@ def _placeholder_for(role: str) -> str:
     return "Ask about the kelp industry…"
 
 
-def _handle_internal_turn(
+def _stream_internal_turn(
     gi: GraphInstance, prompt: str, prior_history: list[dict],
-) -> str:
+):
+    """Streaming internal turn.  Yields ``{"status": ...}`` dicts for
+    intermediate tool-loop steps and ``str`` tokens for the final reply."""
     if gi.sleep_pass_running:
-        return (
-            "Working-memory maintenance is running. Please try again "
-            "in a moment."
-        )
+        yield "Working-memory maintenance is running. Please try again in a moment."
+        return
     agent = GraphAgent(gi)
     history = _windowed_history(prior_history)
     try:
-        return agent.call(prompt, history=history)
+        yield from agent.stream_call(prompt, history=history)
     except Exception as exc:
-        return f"Error: {exc}"
+        yield f"Error: {exc}"
 
 
-def _handle_external_turn(
+def _stream_external_turn(
     gi: GraphInstance, prompt: str, prior_history: list[dict],
-) -> str:
+):
+    """Streaming external turn.  Yields scrubbed sentence chunks."""
     if gi.sleep_pass_running:
-        return "The service is briefly unavailable. Please try again in a moment."
+        yield "The service is briefly unavailable. Please try again in a moment."
+        return
     try:
         history = _windowed_history(prior_history)
-        return fast_query(gi, prompt, mode="external", history=history)
+        yield from fast_query_stream(gi, prompt, mode="external", history=history)
     except Exception:
-        return "I don't have information on that."
+        yield "I don't have information on that."
+
+
+_FROZEN_TIMER_TEMPLATE = """
+<style>
+    html, body {{ margin: 0; padding: 0; overflow: hidden; }}
+    #rt {{
+        color: #888;
+        font-size: 14px;
+        line-height: 24px;
+        height: 24px;
+        font-variant-numeric: tabular-nums;
+        font-family: -apple-system, BlinkMacSystemFont,
+            'Segoe UI', 'Helvetica Neue', sans-serif;
+    }}
+</style>
+<div id="rt">⏱ {elapsed:.1f}s</div>
+"""
+
+
+def _render_frozen_timer(elapsed: float) -> None:
+    """Render a static timer iframe with the same wrapper as the live one
+    so the layout doesn't shift when the live iframe is replaced."""
+    components.html(
+        _FROZEN_TIMER_TEMPLATE.format(elapsed=elapsed),
+        height=28,
+    )
+
+
+def _handle_file_upload(
+    gi: GraphInstance,
+    uploaded_file,
+    user_text: str,
+) -> str:
+    """Save the uploaded file to data/raw/ and run ingest (§16.13)."""
+    import unicodedata
+
+    if gi.sleep_pass_running:
+        return "Working-memory maintenance is running. Cannot ingest right now."
+
+    basename = unicodedata.normalize("NFKC", uploaded_file.name)
+    raw_dir = Path("data") / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / basename
+    dest.write_bytes(uploaded_file.read())
+
+    agent = GraphAgent(gi)
+    result = agent._impl_ingest_file({"filename": basename})
+
+    if result.get("error"):
+        return f"Upload failed: {result['error']}"
+
+    nodes = result.get("nodes_added") or result.get("total_nodes_added", 0)
+    edges = result.get("edges_added") or result.get("total_edges_added", 0)
+    chunked = result.get("chunked", False)
+    parts = [f"Ingested **{basename}**"]
+    if chunked:
+        parts.append(
+            f"({result.get('chunks_processed', '?')}/{result.get('chunks_total', '?')} chunks)"
+        )
+    parts.append(f"— {nodes} nodes, {edges} edges added.")
+    return " ".join(parts)
 
 
 def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
@@ -293,29 +411,128 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
     for m in st.session_state.get("messages", []):
         if m["role"] in ("user", "assistant"):
             with st.chat_message(m["role"]):
+                if m["role"] == "assistant" and "elapsed" in m:
+                    _render_frozen_timer(float(m["elapsed"]))
                 st.markdown(m.get("content") or "")
 
-    user_input = st.chat_input(_placeholder_for(role))
+    chat_kwargs: dict = {"placeholder": _placeholder_for(role)}
+    if role == ROLE_INTERNAL:
+        chat_kwargs["accept_file"] = True
+        chat_kwargs["file_type"] = ["pdf", "txt", "md"]
+
+    user_input = st.chat_input(**chat_kwargs)
     if not user_input:
         return
 
-    st.session_state["messages"].append({"role": "user", "content": user_input})
+    uploaded_file = None
+    if hasattr(user_input, "text"):
+        uploaded_files = getattr(user_input, "files", None) or []
+        uploaded_file = uploaded_files[0] if uploaded_files else None
+        user_text = user_input.text or ""
+    else:
+        user_text = str(user_input)
+
+    if uploaded_file and role == ROLE_INTERNAL:
+        reply = _handle_file_upload(gi, uploaded_file, user_text)
+        display_text = user_text or f"[uploaded {uploaded_file.name}]"
+        st.session_state["messages"].append({"role": "user", "content": display_text})
+        with st.chat_message("user"):
+            st.markdown(display_text)
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+        st.session_state["messages"].append({"role": "assistant", "content": reply})
+        store.save_chat(
+            active_conv_id, USER_ID_BY_ROLE[role], role, st.session_state["messages"],
+        )
+        gi.save()
+        st.rerun()
+        return
+
+    prompt = user_text
+    if not prompt:
+        return
+
+    st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(user_input)
+        st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…" if role == ROLE_INTERNAL else "Looking it up…"):
-            if role == ROLE_INTERNAL:
-                reply = _handle_internal_turn(
-                    gi, user_input, st.session_state["messages"][:-1],
-                )
-            else:
-                reply = _handle_external_turn(
-                    gi, user_input, st.session_state["messages"][:-1],
-                )
-        st.markdown(reply)
+        t0 = time.monotonic()
 
-    st.session_state["messages"].append({"role": "assistant", "content": reply})
+        timer_slot = st.empty()
+        # Live JS timer in an iframe (components.html executes scripts).
+        # Wrapped in st.empty() so we can replace it the moment the stream
+        # ends — otherwise the iframe keeps ticking until st.rerun().
+        with timer_slot:
+            components.html(
+                """
+                <style>
+                    html, body { margin: 0; padding: 0; overflow: hidden; }
+                    #rt {
+                        color: #888;
+                        font-size: 14px;
+                        line-height: 24px;
+                        height: 24px;
+                        font-variant-numeric: tabular-nums;
+                        font-family: -apple-system, BlinkMacSystemFont,
+                            'Segoe UI', 'Helvetica Neue', sans-serif;
+                    }
+                </style>
+                <div id="rt">⏱ 0.0s</div>
+                <script>
+                (function() {
+                    var s = Date.now();
+                    var el = document.getElementById('rt');
+                    setInterval(function() {
+                        el.textContent = '⏱ ' + ((Date.now() - s) / 1000).toFixed(1) + 's';
+                    }, 100);
+                })();
+                </script>
+                """,
+                height=28,
+            )
+
+        status_slot = st.empty()
+        text_slot = st.empty()
+
+        prior = st.session_state["messages"][:-1]
+        if role == ROLE_INTERNAL:
+            stream = _stream_internal_turn(gi, prompt, prior)
+        else:
+            stream = _stream_external_turn(gi, prompt, prior)
+
+        collected: list[str] = []
+        for chunk in stream:
+            if isinstance(chunk, dict):
+                if "status" in chunk:
+                    # Strip trailing ellipsis / dots — CSS animates them.
+                    label = chunk["status"].rstrip("…").rstrip(".")
+                    status_slot.markdown(
+                        f'<span class="agent-status">{label}'
+                        f'<span class="d d1">.</span>'
+                        f'<span class="d d2">.</span>'
+                        f'<span class="d d3">.</span>'
+                        f'</span>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                status_slot.empty()
+                collected.append(chunk)
+                text_slot.markdown("".join(collected))
+
+        elapsed = time.monotonic() - t0
+        # Freeze timer with another iframe (no script) so the surrounding
+        # Streamlit wrapper stays consistent — swapping iframe → markdown
+        # would shift vertical position.  Same wrapper as history render.
+        with timer_slot:
+            _render_frozen_timer(elapsed)
+        status_slot.empty()
+        reply = "".join(collected) or "(no response)"
+        text_slot.markdown(reply)
+
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": reply, "elapsed": round(elapsed, 1)},
+    )
     store.save_chat(
         active_conv_id, USER_ID_BY_ROLE[role], role, st.session_state["messages"],
     )
