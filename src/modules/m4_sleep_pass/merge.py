@@ -256,6 +256,11 @@ def _judge_pair(client, storage: GraphStorage, a: Node, b: Node) -> dict:
 
 
 def _fuse(client, a: Node, b: Node) -> tuple[str, str]:
+    """Merge two nodes' descriptions into one. Runs with thinking=False
+    (§16.17.7): combining two existing summaries into one is a text-merge
+    task, not a reasoning task — the same reason M1 intra-doc fuse is
+    thinking-off. The judgement of "are these the same entity?" already
+    happened upstream in `_judge_pair` (which IS thinking-on)."""
     user = (
         "Node A:\nLabel: {al}\nSummary: {as_}\nDetail: {ad}\n\n"
         "Node B:\nLabel: {bl}\nSummary: {bs}\nDetail: {bd}"
@@ -269,6 +274,7 @@ def _fuse(client, a: Node, b: Node) -> tuple[str, str]:
             {"role": "user", "content": user},
         ],
         temperature=0.1,
+        thinking=False,
     )
     parsed = _parse_json_loose(resp.choices[0].message.content or "")
     summary = str(parsed.get("summary", f"{a.label} / {b.label}"))[: SUMMARY_MAX_TOKENS * 4]
@@ -291,6 +297,14 @@ def _execute_merge(
     # Pick the higher-weighted original's type/label as the canonical.
     primary, secondary = (a, b) if a.weight >= b.weight else (b, a)
 
+    # §16.17 source-text linkage: the fused node inherits chunk pointers
+    # from both originals so query-time chunk lookup keeps working after
+    # cross-document merges (Tesla / Tesla Inc → Tesla still points back to
+    # every chunk that mentioned either form). list(set(...)) preserves
+    # uniqueness without enforcing an order — chunks_for_seed() at query
+    # time picks an ordering anyway.
+    fused_text_unit_ids = list(set(a.text_unit_ids) | set(b.text_unit_ids))
+
     new_node = Node(
         id=str(uuid4()),
         type=primary.type,
@@ -304,6 +318,7 @@ def _execute_merge(
             inputs=[NodeRef(id=a.id, version=a.version), NodeRef(id=b.id, version=b.version)],
             llm_run_id=pass_id,
         ),
+        text_unit_ids=fused_text_unit_ids,
     )
     storage.add_node(new_node)
     # Index the fused node; drop originals from the index immediately so
@@ -331,7 +346,17 @@ def _execute_merge(
             continue  # drop self-loops produced by the A-B edge itself
         twin = _find_twin(new_src, new_tgt, e.type)
         if twin is not None:
+            # §16.17 fix (2026-05-10): twin absorbs e — sum weight AND
+            # union text_unit_ids so the source-text linkage from the
+            # absorbed edge isn't dropped. Same union semantics that
+            # _execute_merge applies to the fused node above. Also keep
+            # the longer evidence_quote (more informative span) for the
+            # downstream show_provenance / chat citation paths.
             twin.weight += e.weight
+            if e.text_unit_ids:
+                twin.text_unit_ids = sorted(set(twin.text_unit_ids) | set(e.text_unit_ids))
+            if e.evidence_quote and len(e.evidence_quote) > len(twin.evidence_quote or ""):
+                twin.evidence_quote = e.evidence_quote
             continue
         new_edge = e.model_copy(update={"source_id": new_src, "target_id": new_tgt})
         storage.add_edge(new_edge)

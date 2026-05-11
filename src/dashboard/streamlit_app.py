@@ -386,15 +386,35 @@ def _handle_file_upload(
     if result.get("error"):
         return f"Upload failed: {result['error']}"
 
-    nodes = result.get("nodes_added") or result.get("total_nodes_added", 0)
-    edges = result.get("edges_added") or result.get("total_edges_added", 0)
-    chunked = result.get("chunked", False)
+    nodes = result.get("nodes_added", 0)
+    pass1_edges = result.get("edges_added", 0)
+    pass2_edges = result.get("pass2_edges_added", 0)
+    # Single-doc path uses `pages_processed`; super-chunk split path
+    # exposes `total_pages` instead. Read both, prefer the split count
+    # when present.
+    pages = result.get("total_pages") or result.get("pages_processed", 0)
+    fused = result.get("nodes_fused", 0)
+    reclassified = result.get("edges_reclassified", 0)
+    duplicates = result.get("duplicate_edges_removed", 0)
+    superchunks = result.get("split_into_superchunks", 0)
+    final_edges = pass1_edges + pass2_edges - duplicates
     parts = [f"Ingested **{basename}**"]
-    if chunked:
-        parts.append(
-            f"({result.get('chunks_processed', '?')}/{result.get('chunks_total', '?')} chunks)"
-        )
-    parts.append(f"— {nodes} nodes, {edges} edges added.")
+    if pages > 1:
+        page_label = f"({pages} pages"
+        if superchunks > 1:
+            ok = result.get("superchunks_ok", superchunks)
+            page_label += f", split into {ok}/{superchunks} super-chunks"
+        page_label += ")"
+        parts.append(page_label)
+    parts.append(
+        f"— {nodes} nodes, {final_edges} edges "
+        f"({pass2_edges} from PASS 2"
+        + (f", {duplicates} dup removed" if duplicates else "")
+        + ")"
+        + (f", {reclassified} reclassified" if reclassified else "")
+        + (f", {fused} fused" if fused else "")
+        + "."
+    )
     return " ".join(parts)
 
 

@@ -14,6 +14,7 @@ per-pass so they are not re-asked; when a round adds no new edges it exits.
 import json
 import re
 from collections import deque
+from pathlib import Path
 
 from src.graph.instance import GraphInstance
 from src.graph.models import DerivedProv, Edge, NodeRef
@@ -27,6 +28,24 @@ from .state import (
     LINK_MAX_NEW_PER_ROUND,
     PassState,
 )
+
+
+def _load_ontology_context(instance: GraphInstance):
+    """Parse ontology + aliases for this link_step round.
+
+    Cheap (<5 ms) and intentionally not cached: the user can edit
+    ontology.md between sleep passes and we want the new constraints
+    to apply on the next round, not after a process restart.
+    Returns ``(relation_types, domain_map, alias_map)``.
+    """
+    from src.modules.m1_ingest import parse_aliases, parse_ontology
+    try:
+        text = Path(instance.ontology_path).read_text(encoding="utf-8")
+    except Exception:
+        text = ""
+    _ents, rels, dom = parse_ontology(text)
+    aliases = parse_aliases(text)
+    return rels, dom, aliases
 
 LINK_SYSTEM_PROMPT = """You are a knowledge-graph discovery judge. You look
 at two nodes (plus the path of intermediate nodes that link them) and decide
@@ -273,6 +292,17 @@ def link_step(state: PassState, *, instance: GraphInstance) -> dict:
     pass_id = state.get("pass_id", "unknown")
     iter_idx = int(state.get("link_iter", 0))
 
+    # §16.17 round-2 fix (2026-05-10): every edge proposed by link_form
+    # now goes through the same ontology validator the M1 ingest pipeline
+    # uses. This applies aliases (model typos like AFFULIATED_WITH get
+    # rewritten), domain checks (Location → Product OWNED_BY gets downgraded
+    # rather than added with bad semantics), and emits ontology_proposal
+    # logs so M4d's new-type proposals show up alongside M1's in the
+    # evolution signal stream.
+    ontology_relation_types, ontology_domain_map, ontology_aliases = (
+        _load_ontology_context(instance)
+    )
+
     tried: set[str] = set(state.get("link_tried_pairs") or [])  # sorted-pair strings
     seeds = _seeds(state, storage)
 
@@ -396,6 +426,40 @@ def link_step(state: PassState, *, instance: GraphInstance) -> dict:
                 })
                 continue
 
+            # §16.17 ontology validation. The classifier rewrites aliases,
+            # checks the domain against the ontology, and emits the
+            # ontology_proposal events that record M4d's contribution to
+            # the evolution signal stream. If the model's chosen type is
+            # registered but used out-of-domain (e.g., OWNED_BY with a
+            # Location source), it gets downgraded to RELATED_TO — which
+            # link_form then rejects because RELATED_TO is in the
+            # forbidden-vague set.
+            from src.modules.m1_ingest import _classify_edge_type
+            validated_type = _classify_edge_type(
+                edge_type, src_node.type, src_node.label,
+                tgt_node.type, tgt_node.label, why,
+                ontology_relation_types, ontology_domain_map, log_event,
+                raw_doc_id="(link_form)", run_id=pass_id, page_num=None,
+                pass_label="link_form",
+                alias_map=ontology_aliases,
+            )
+            if validated_type in _FORBIDDEN_VAGUE_EDGE_TYPES:
+                rejected_vague += 1
+                log_event({
+                    "kind": "link_rejected_vague_type",
+                    "pass_id": pass_id,
+                    "summary": (
+                        f"{seed_node.label} ~ {remote_node.label}: "
+                        f"validator returned {validated_type} "
+                        f"(model proposed {edge_type})"
+                    ),
+                    "edge_type": validated_type,
+                    "original_edge_type": edge_type,
+                    "what": what,
+                })
+                continue
+            edge_type = validated_type
+
             new_edge = Edge(
                 source_id=src_id,
                 target_id=tgt_id,
@@ -408,6 +472,7 @@ def link_step(state: PassState, *, instance: GraphInstance) -> dict:
                             for pid in path if storage.get_node(pid) is not None],
                     llm_run_id=pass_id,
                 ),
+                evidence_quote=(why or "")[:240],
             )
             storage.add_edge(new_edge)
             added += 1

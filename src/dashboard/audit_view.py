@@ -26,6 +26,7 @@ from src.dashboard.audit_render import (
     parse_history_events,
     render_cytoscape_html,
 )
+from src.dashboard.layout_cache import ensure_layout
 from src.graph.instance import GraphInstance
 
 _LOG_PATH = Path(__file__).resolve().parents[2] / "log.md"
@@ -99,11 +100,22 @@ def _build_view(
 ) -> tuple[dict, str]:
     """Return (cytoscape_elements, status_caption) for the current view."""
     storage = instance.storage
+    # Task 3 (2026-05-11): precomputed positions live next to graph.pkl;
+    # `ensure_layout` recomputes on miss so first-ever load also works.
+    instance_dir = storage.path.parent
+    positions = ensure_layout(instance_dir, storage)
     if selected_event is None:
-        elements = graph_to_cytoscape(storage)
+        elements = graph_to_cytoscape(storage, layout_positions=positions)
+        stats = elements["stats"]
+        # Exclude ghost tombstones (merged_into != None) from the
+        # user-visible count — they are audit residue, not real entities
+        # (§5.5: ghosts kept one pass post-merge for traceability).
+        # Orphans (degree=0) stay in the count because they ARE real
+        # extracted entities, just not connected yet.
+        visible_total = stats["total_nodes"] - stats["ghosts_hidden"]
         return elements, (
-            f"Showing the full graph: {len(elements['nodes'])} nodes / "
-            f"{len(elements['edges'])} edges"
+            f"Full graph: {visible_total} nodes / "
+            f"{stats['total_edges']} edges"
         )
 
     if selected_event["kind"] == "ingest":
@@ -118,6 +130,7 @@ def _build_view(
             focus_node_ids=focus_ids,
             highlight_node_ids=focus_ids,
             add_neighbor_hop=True,
+            layout_positions=positions,
         )
         return elements, (
             f"Ingest event focus: {len(focus_ids)} new nodes from "
@@ -134,6 +147,7 @@ def _build_view(
         highlight_node_ids=merged_ids,
         highlight_edge_ids=pruned_edge_ids | added_edge_ids,
         add_neighbor_hop=bool(focus_ids),
+        layout_positions=positions,
     )
     parts = []
     if merged_ids:

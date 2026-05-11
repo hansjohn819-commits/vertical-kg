@@ -254,18 +254,33 @@ def graph_to_cytoscape(
     highlight_node_ids: set[str] | None = None,
     highlight_edge_ids: set[str] | None = None,
     add_neighbor_hop: bool = False,
+    layout_positions: dict[str, tuple[float, float]] | None = None,
 ) -> dict:
-    """Build {nodes: [...], edges: [...]} for cytoscape.
+    """Build {nodes: [...], edges: [...], stats: {...}} for cytoscape.
 
     `focus_node_ids` — if provided, only emit these nodes (+ optional 1-hop
                        neighbors when `add_neighbor_hop`). Used by past-event
                        focused-subgraph view.
     `highlight_node_ids` / `highlight_edge_ids` — visually flagged
                        (CSS class `highlight`) but rendered the same way.
+    `layout_positions` — task 3 (2026-05-11): precomputed {node_id: (x, y)}
+                       attached to each node so the frontend uses
+                       ``layout: 'preset'`` (zero browser compute) instead
+                       of running fcose. Nodes missing from the map fall
+                       back to a tiny random offset around origin so a
+                       just-ingested-but-not-yet-laid-out node still
+                       renders.
 
     Active nodes only (skip ghosts where merged_into is set), unless the
     ghost is explicitly in focus_node_ids (so a past merge event can show
     the now-retired originals).
+
+    Returns dict with three keys:
+      ``nodes`` / ``edges`` — cytoscape elements payload.
+      ``stats``             — {total_nodes, total_edges, orphans_hidden,
+                               ghosts_hidden} computed against the full
+                               storage so the caption can show authoritative
+                               counts even when filtered.
     """
     focus = focus_node_ids
     if focus and add_neighbor_hop:
@@ -275,8 +290,25 @@ def graph_to_cytoscape(
                 expanded.add(nb.id)
         focus = expanded
 
+    # Stats are computed against the WHOLE graph (regardless of focus) so
+    # the caption reports the authoritative total, not the filtered view.
+    total_nodes = 0
+    total_edges = 0
+    orphans_hidden = 0
+    ghosts_hidden = 0
+    for n in storage.nodes():
+        total_nodes += 1
+        if n.merged_into is not None:
+            ghosts_hidden += 1
+        elif storage.degree(n.id) == 0:
+            orphans_hidden += 1
+    for _ in storage.edges():
+        total_edges += 1
+
     nodes_out: list[dict] = []
     seen_node_ids: set[str] = set()
+    import random as _random
+    _rng = _random.Random(0)  # deterministic fallback positions
     for n in storage.nodes():
         if focus is not None and n.id not in focus:
             continue
@@ -294,7 +326,8 @@ def graph_to_cytoscape(
         rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
         source_quote = getattr(prov, "line_or_span", None) if prov is not None else None
         title = display_title(rid) if rid else None
-        nodes_out.append({
+        degree = storage.degree(n.id)
+        elem: dict = {
             "data": {
                 "id": n.id,
                 "label": n.label,
@@ -311,8 +344,37 @@ def graph_to_cytoscape(
                 "is_ghost": n.merged_into is not None,
                 "merged_into": n.merged_into or "",
                 "detail": (n.detail or "")[:1500],
+                "degree": degree,
+                # Pre-scaled size dimensions for cytoscape stylesheet
+                # `data()` references. Seeded at scale=1.0; JS updates on
+                # zoom by multiplying the BASE values by the counter-scale
+                # factor (1/zoom above FREEZE_ZOOM, else 1.0). Using
+                # `data()` instead of `mapData()` because cytoscape's
+                # mapData doesn't reliably re-evaluate on data changes —
+                # plain data() refs do.
+                "cs_w": 22,        # base width/height
+                "cs_w_hl": 28,     # highlight (focus subgraph) size
+                "cs_font": 11,     # label font
+                "cs_b": 1.5,       # base border thickness
+                "cs_b_sel": 3.5,   # :selected border thickness
+                "cs_b_hl": 3,      # [?highlight] border thickness
+                "cs_outline": 2,   # text outline width (label halo)
+                "cs_tmy": -6,      # label vertical margin (above node)
             },
-        })
+        }
+        if layout_positions is not None:
+            xy = layout_positions.get(n.id)
+            if xy is None:
+                # Just-ingested node not in cache yet — random offset near
+                # origin keeps the preset layout working until the next save
+                # refreshes the cache.
+                elem["position"] = {
+                    "x": _rng.uniform(-50, 50),
+                    "y": _rng.uniform(-50, 50),
+                }
+            else:
+                elem["position"] = {"x": xy[0], "y": xy[1]}
+        nodes_out.append(elem)
         seen_node_ids.add(n.id)
 
     edges_out: list[dict] = []
@@ -327,10 +389,26 @@ def graph_to_cytoscape(
                 "label": e.type,
                 "weight": round(e.weight, 3),
                 "highlight": bool(highlight_edge_ids and e.id in highlight_edge_ids),
+                # Pre-scaled edge dimensions (mirror of node cs_w family).
+                "cs_ew": 1.1,       # base line width
+                "cs_ew_sel": 2.2,   # :selected line width
+                "cs_ew_hl": 2.0,    # [?highlight] line width
+                "cs_arrow": 0.7,    # arrow-head scale
             },
         })
 
-    return {"nodes": nodes_out, "edges": edges_out}
+    return {
+        "nodes": nodes_out,
+        "edges": edges_out,
+        "stats": {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "orphans_hidden": orphans_hidden,
+            "ghosts_hidden": ghosts_hidden,
+            "rendered_nodes": len(nodes_out),
+            "rendered_edges": len(edges_out),
+        },
+    }
 
 
 # --- HTML template ----------------------------------------------------------
@@ -362,8 +440,11 @@ def render_cytoscape_html(
     canvas naturally tracks browser-window height with no hard-coded px.
 
     Behaviour:
-      - fcose layout (force-directed, smooth)
-      - Pan / zoom built-in
+      - Preset layout (positions precomputed in Python; zero browser cost)
+      - Infinite-ish zoom (0.05 ≤ zoom ≤ 100)
+      - Viewport degree-threshold: at most VIEWPORT_NODE_CAP nodes visible
+        at any zoom level; threshold T rises as more nodes enter viewport
+        and falls as the user zooms into a sub-region (task 3 B, 2026-05-11)
       - Node click → floating card near node, smooth fade
       - Empty space click → card fades out
       - Other-node click → card jumps to new position with new content
@@ -509,9 +590,6 @@ def render_cytoscape_html(
   }}
 </style>
 <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
-<script src="https://unpkg.com/layout-base@2.0.1/layout-base.js"></script>
-<script src="https://unpkg.com/cose-base@2.2.0/cose-base.js"></script>
-<script src="https://unpkg.com/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
 </head>
 <body>
 <canvas id="bg-particles"></canvas>
@@ -775,23 +853,17 @@ def render_cytoscape_html(
 
   const ELEMENTS = {payload};
 
+  // Task 3 (2026-05-11): backend precomputes positions via networkx
+  // spring_layout (see src/dashboard/layout_cache.py) and ships them in
+  // each node's `position`. Frontend uses `preset` so cytoscape just
+  // plants nodes — no in-browser force-directed iteration, no main-
+  // thread freeze even at 5K+ nodes.
   const cy = cytoscape({{
     container: document.getElementById('cy'),
     elements: ELEMENTS,
-    layout: {{
-      name: 'fcose',
-      animate: true,
-      randomize: true,
-      idealEdgeLength: 95,
-      nodeRepulsion: 8500,
-      gravity: 0.18,
-      gravityCompound: 1.5,
-      numIter: 2500,
-      tile: true,
-      packComponents: true,
-    }},
-    minZoom: 0.2,
-    maxZoom: 2.2,
+    layout: {{ name: 'preset', fit: true, padding: 30 }},
+    minZoom: 0.05,
+    maxZoom: 100,
     wheelSensitivity: 0.25,
     style: [
       {{
@@ -800,25 +872,53 @@ def render_cytoscape_html(
           'background-color': 'data(color)',
           'label': 'data(label)',
           'color': '#c0caf5',
-          'font-size': 11,
           'font-weight': 500,
-          'text-outline-width': 2,
+          // Label outline halo + vertical offset are also counter-scaled
+          // — otherwise at zoom > 1 the 2-model-unit outline turns into a
+          // 6+ px black ring around every character (adjacent characters'
+          // outlines merge into a solid black blob) and labels drift far
+          // away from their nodes. cs_outline / cs_tmy track scale just
+          // like cs_w / cs_font.
+          'text-outline-width': 'data(cs_outline)',
           'text-outline-color': '#16171f',
-          'text-margin-y': -6,
-          'width': 22, 'height': 22,
-          'border-width': 1.5,
+          'text-margin-y': 'data(cs_tmy)',
           'border-color': 'rgba(255,255,255,0.18)',
           'overlay-padding': 4,
-          'transition-property': 'background-color, border-color, width, height',
+          'transition-property': 'border-color',
           'transition-duration': '120ms',
+          // All size dimensions are data()-driven from per-element fields
+          // (cs_w / cs_b / cs_font etc., precomputed by the JS zoom
+          // handler). cytoscape re-evaluates `data()` references on
+          // every render, INCLUDING when :selected / [?highlight] rules
+          // turn on — so size is always the current zoom-counter-scaled
+          // value regardless of how selection state toggled. There is no
+          // inline `n.style({{...}})` anywhere; that approach got wiped
+          // by cytoscape on selection state changes and was the root
+          // cause of the "selected node stays big" / "border disappears"
+          // bugs.
+          'width':        'data(cs_w)',
+          'height':       'data(cs_w)',
+          'font-size':    'data(cs_font)',
+          'border-width': 'data(cs_b)',
         }},
       }},
       {{
+        // Task 3 B: hidden by the viewport degree-threshold logic.
+        // `display: none` removes them from layout / picking entirely.
+        selector: 'node.threshold-hidden, edge.threshold-hidden',
+        style: {{ 'display': 'none' }},
+      }},
+      {{
+        // Audit-focus highlight (set at Python render time via
+        // `highlight_node_ids`). Always-on for the session, never toggles
+        // — safe to bump size. Red ring distinguishes it from the
+        // yellow user-selection ring below.
         selector: 'node[?highlight]',
         style: {{
-          'border-color': '#ffd166',
-          'border-width': 3,
-          'width': 28, 'height': 28,
+          'border-color': '#f7768e',
+          'width':        'data(cs_w_hl)',
+          'height':       'data(cs_w_hl)',
+          'border-width': 'data(cs_b_hl)',
         }},
       }},
       {{
@@ -829,40 +929,47 @@ def render_cytoscape_html(
         }},
       }},
       {{
+        // User selection — yellow ring + thicker border. NO size change
+        // (size stays driven by the base node rule's data()). Selection
+        // visual is purely additive: cytoscape toggles border-color and
+        // border-width on/off cleanly, no events to miss, no inline-
+        // style ghosts.
         selector: 'node:selected',
         style: {{
-          'border-color': '#7aa2f7',
-          'border-width': 3.5,
-          'width': 28, 'height': 28,
+          'border-color': '#ffd166',
+          'border-width': 'data(cs_b_sel)',
         }},
       }},
       {{
         selector: 'edge',
         style: {{
           'curve-style': 'bezier',
-          'width': 1.1,
           'line-color': 'rgba(160, 173, 209, 0.22)',
           'target-arrow-shape': 'triangle',
           'target-arrow-color': 'rgba(160, 173, 209, 0.34)',
-          'arrow-scale': 0.7,
           'opacity': 0.85,
+          'width':       'data(cs_ew)',
+          'arrow-scale': 'data(cs_arrow)',
         }},
       }},
       {{
         selector: 'edge[?highlight]',
         style: {{
-          'line-color': '#ffd166',
-          'target-arrow-color': '#ffd166',
-          'width': 2.0,
+          'line-color': '#f7768e',
+          'target-arrow-color': '#f7768e',
           'opacity': 1.0,
+          'width': 'data(cs_ew_hl)',
         }},
       }},
       {{
+        // Edge selection — yellow line + slightly thicker. Like nodes,
+        // size/width is data()-driven so it tracks zoom correctly even
+        // through selection state changes.
         selector: 'edge:selected',
         style: {{
-          'line-color': '#7aa2f7',
-          'target-arrow-color': '#7aa2f7',
-          'width': 2.2,
+          'line-color': '#ffd166',
+          'target-arrow-color': '#ffd166',
+          'width': 'data(cs_ew_sel)',
         }},
       }},
     ],
@@ -958,6 +1065,146 @@ def render_cytoscape_html(
     if (sel.nonempty() && card.classList.contains('visible')) {{
       positionCard(sel[0]);
     }}
+  }});
+
+  // ---- Task 3 B: viewport-aware degree threshold ----
+  // Keep at most VIEWPORT_NODE_CAP nodes visible. The threshold T is the
+  // smallest degree such that #(nodes in viewport with degree >= T) <= cap.
+  // When zoomed out (many nodes in viewport), T rises; when zoomed into a
+  // sparse region, T falls and more low-degree nodes appear.
+  const VIEWPORT_NODE_CAP = 120;
+  const THRESHOLD_OFF_BELOW_TOTAL = 150;  // small subgraphs skip the cap entirely
+  const ALL_NODES = cy.nodes();
+  const TOTAL_ELIGIBLE = ALL_NODES.length;
+  const THRESHOLD_ENABLED = TOTAL_ELIGIBLE > THRESHOLD_OFF_BELOW_TOTAL;
+
+  function pickThreshold() {{
+    const ext = cy.extent();  // model-coord bbox of current viewport
+    const counts = new Map();
+    ALL_NODES.forEach(n => {{
+      const p = n.position();
+      if (p.x < ext.x1 || p.x > ext.x2 || p.y < ext.y1 || p.y > ext.y2) return;
+      const d = n.data('degree') || 0;
+      counts.set(d, (counts.get(d) || 0) + 1);
+    }});
+    const degs = [...counts.keys()].sort((a, b) => b - a);
+    if (degs.length === 0) return Infinity;
+    let cumulative = 0;
+    let chosen = degs[0];  // safe default: show top tier even if it exceeds cap
+    for (const d of degs) {{
+      const next = cumulative + counts.get(d);
+      if (next > VIEWPORT_NODE_CAP) break;
+      cumulative = next;
+      chosen = d;
+    }}
+    return chosen;
+  }}
+
+  let lastThreshold = -1;
+  function applyThreshold() {{
+    if (!THRESHOLD_ENABLED) return;
+    const T = pickThreshold();
+    if (T === lastThreshold) return;
+    lastThreshold = T;
+    cy.startBatch();
+    ALL_NODES.forEach(n => {{
+      const d = n.data('degree') || 0;
+      if (d >= T) {{
+        n.removeClass('threshold-hidden');
+      }} else {{
+        n.addClass('threshold-hidden');
+      }}
+    }});
+    cy.edges().forEach(e => {{
+      if (e.source().hasClass('threshold-hidden') || e.target().hasClass('threshold-hidden')) {{
+        e.addClass('threshold-hidden');
+      }} else {{
+        e.removeClass('threshold-hidden');
+      }}
+    }});
+    cy.endBatch();
+  }}
+
+  // Debounce pan/zoom so we don't recompute every frame while the user drags.
+  let _thrTimer = null;
+  cy.on('pan zoom', () => {{
+    if (_thrTimer) clearTimeout(_thrTimer);
+    _thrTimer = setTimeout(applyThreshold, 150);
+  }});
+
+  // ---- Task 3 (cont.): zoom-counter-scale via precomputed data fields ----
+  // Past zoom ≈ 1.0 we want on-screen size of nodes/edges to stay
+  // constant (otherwise they grow with zoom and re-overlap). For each
+  // visual dimension the stylesheet binds `data(cs_<dim>)` — a per-
+  // element pre-scaled value. On every zoom event we recompute these
+  // (BASE × counter-scale) and write them via `n.data({{...}})`.
+  // cytoscape's data-event mechanism then re-runs every applicable
+  // style rule, including :selected and [?highlight], so size always
+  // tracks the current zoom regardless of selection toggling.
+  const FREEZE_ZOOM = 1.0;
+  const NODE_BASE_W = 22, NODE_HL_W = 28;
+  const NODE_BASE_FONT = 11;
+  const NODE_BASE_B = 1.5, NODE_SEL_B = 3.5, NODE_HL_B = 3;
+  const TEXT_OUTLINE_BASE = 2;
+  const TEXT_MARGIN_Y_BASE = -6;
+  const EDGE_BASE_W = 1.1, EDGE_SEL_W = 2.2, EDGE_HL_W = 2.0;
+  const ARROW_BASE = 0.7;
+
+  function _currentScale() {{
+    const z = cy.zoom();
+    return z > FREEZE_ZOOM ? (FREEZE_ZOOM / z) : 1.0;
+  }}
+
+  let _lastScale = -1;
+  function applyAllScale() {{
+    const s = _currentScale();
+    if (Math.abs(s - _lastScale) < 0.01) return;
+    _lastScale = s;
+    const nodeFields = {{
+      cs_w: NODE_BASE_W * s,
+      cs_w_hl: NODE_HL_W * s,
+      cs_font: NODE_BASE_FONT * s,
+      cs_b: NODE_BASE_B * s,
+      cs_b_sel: NODE_SEL_B * s,
+      cs_b_hl: NODE_HL_B * s,
+      cs_outline: TEXT_OUTLINE_BASE * s,
+      cs_tmy: TEXT_MARGIN_Y_BASE * s,
+    }};
+    const edgeFields = {{
+      cs_ew: EDGE_BASE_W * s,
+      cs_ew_sel: EDGE_SEL_W * s,
+      cs_ew_hl: EDGE_HL_W * s,
+      cs_arrow: ARROW_BASE * s,
+    }};
+    cy.startBatch();
+    cy.nodes().forEach(n => n.data(nodeFields));
+    cy.edges().forEach(e => e.data(edgeFields));
+    cy.endBatch();
+  }}
+  let _scalePending = false;
+  function scheduleAllScale() {{
+    if (_scalePending) return;
+    _scalePending = true;
+    requestAnimationFrame(() => {{
+      _scalePending = false;
+      applyAllScale();
+    }});
+  }}
+  cy.on('zoom', scheduleAllScale);
+
+  // Initial pass — runs AFTER all the const/let/function declarations
+  // above so applyAllScale has access to its closures (FREEZE_ZOOM,
+  // _lastScale, etc.). cy.ready guarantees the preset layout + fit are
+  // settled so cy.zoom() returns the fitted zoom and cy.extent() returns
+  // the correct viewport bbox. Both functions are accurate here.
+  // Earlier we had this block BEFORE the declarations; cytoscape fires
+  // ready synchronously (since the graph is already ready by the time
+  // we register), which hit a TDZ on the const/let names and threw a
+  // silent ReferenceError — that prevented the zoom listener below from
+  // registering and broke counter-scale entirely.
+  cy.ready(() => {{
+    applyAllScale();
+    applyThreshold();
   }});
 </script>
 </body>

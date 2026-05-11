@@ -22,10 +22,28 @@ DETAIL_MAX_TOKENS = 8_000
 # + ~1K prompt overhead ≈ 107K real, comfortably under 128K.
 INGEST_INPUT_MAX_TOKENS = 80_000
 
-# PDF chunking overlap: each chunk after the first repeats this many pages
-# from the tail of the previous chunk so cross-page sentences and tables
-# aren't sliced (guide §12.5.5).
-INGEST_PDF_PAGE_OVERLAP = 2
+# PDF chunking overlap: kept for back-compat of any caller still using the
+# constant, but §16.17 cut over to per-page chunking so the overlap is now
+# 0 — chunk = exactly one page, no sliding window. Cross-page coreference
+# is handled at the LLM-prompt layer instead (stateful prior_entities block
+# in M1 PASS 1, see §16.17.3).
+INGEST_PDF_PAGE_OVERLAP = 0
+
+# Super-chunk wrapper above M1 (2026-05-10). Long PDFs get split into
+# super-chunks of at most this many pages BEFORE handing off to M1; each
+# super-chunk runs the full M1 pipeline (PASS 1 + PASS 2 + intra-doc fuse
+# + reclassifier + dedup) as if it were its own document. Bounded so
+# PASS 1's `prior_entities` block can never grow large enough to overflow
+# the 128K context window: 80 pages × ~8 entities/page × ~84 real tokens
+# per prior-block line ≈ 54K — leaves comfortable headroom for ontology,
+# system prompt, page text, and output. Cross-super-chunk same-entity
+# duplicates are accepted at ingest time and resolved by M4b sleep pass
+# (the same path that handles cross-document duplicates).
+INGEST_SUPERCHUNK_MAX_PAGES = 80
+# 1-page overlap between consecutive super-chunks so an entity defined on
+# the boundary page isn't lost when it's first mentioned in one super-
+# chunk and referenced again at the start of the next.
+INGEST_SUPERCHUNK_OVERLAP_PAGES = 1
 
 
 def count_tokens(text: str) -> int:

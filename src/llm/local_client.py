@@ -64,8 +64,16 @@ class LocalClient:
         non-thinking models (servers drop unrecognized chat_template_kwargs).
         Use False for: (a) external fast_query path (Phase C), (b) M4d
         link_form judge — thinking-on rationalizes trivial relations into
-        plausible-sounding edges, hurting precision. Default True elsewhere
-        (M1 extraction / M2 agent / M4b judges benefit from reasoning).
+        plausible-sounding edges, hurting precision, (c) description-fusion
+        calls (M4b `_fuse` and M1 intra-doc fuse, §16.17.7) — fusing two
+        descriptions into one is not a reasoning task, thinking-on just
+        burns time, (d) M1 PASS 1 + PASS 2 extraction (§16.17.7 revised
+        2026-05-09) — at 2 passes × N pages a thinking-on ingest costs
+        more time than the project can absorb; compensation is an
+        explicit step-by-step procedure embedded in the system prompt
+        that plays the role of chain-of-thought from outside the model.
+        Default True elsewhere (M2 agent loop / M4b `_judge_pair` /
+        `_vote_done` benefit from reasoning).
         """
         kwargs: dict = {
             "model": self.model,

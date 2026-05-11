@@ -19,7 +19,8 @@ from src.graph.instance import GraphInstance
 from src.graph.retrieval import display_title, top_k, with_neighbors
 from src.graph.tokens import (
     INGEST_INPUT_MAX_TOKENS,
-    INGEST_PDF_PAGE_OVERLAP,
+    INGEST_SUPERCHUNK_MAX_PAGES,
+    INGEST_SUPERCHUNK_OVERLAP_PAGES,
     count_tokens,
 )
 from src.graph.traversal_log import append_query
@@ -72,8 +73,188 @@ SYSTEM_PROMPT = (
     "because the user is reading them as one stream of grounded analysis."
 )
 
-# Budget for graph_query retrieval context (§12.5.2).
+# Budget for graph_query retrieval context (§12.5.2). With 128K context
+# (§ changelog 2026-05-05) the cap is generous; the limit exists to guard
+# against pathological cases (a hub entity with 100 source chunks would
+# otherwise dominate the prompt).
 RETRIEVAL_BUDGET_TOKENS = 20_000
+
+
+_RERANK_TOP_N_CHUNKS = 10  # task 1: top-N chunks after rerank
+
+
+def _build_chunk_evidence(
+    instance: "GraphInstance",
+    seeds: list,
+    *,
+    question: str,
+    include_neighbors: bool,
+    use_display_title: bool,
+    top_n_chunks: int = _RERANK_TOP_N_CHUNKS,
+    budget_tokens: int = RETRIEVAL_BUDGET_TOKENS,
+) -> tuple[str, set[str]]:
+    """Build the EVIDENCE section for a composer prompt (§16.17.6 + task 1 rerank).
+
+    Two-stage retrieval:
+      1. ``seeds`` is the entity-level recall (top-K from FAISS over node
+         summaries, K=10 internal/external as of task 1).
+      2. Every chunk attached to those entities (via ``text_unit_ids``) is
+         re-scored against ``question`` by cosine on the same
+         sentence-transformers embedding used for entity recall. The top
+         ``top_n_chunks`` (subject to ``budget_tokens``) make it into the
+         EVIDENCE block, ranked by relevance instead of extraction order.
+
+    Each seed renders as:
+        Entity: <label> (<type>)
+        Summary: <summary>
+        Sources:
+          [from "<doc title>", page N]
+          <verbatim chunk text>
+          ...
+
+    Within a seed, surviving chunks are ordered by their global rerank
+    score (most relevant first). Seeds whose chunks all lose the rerank
+    still render with label + summary — useful as an indication that the
+    entity matched but no chunk was strongly relevant.
+
+    Trailing NEIGHBORS section (internal only) lists 1-hop neighbors with
+    summary only — no chunk injection — to give the agent loop pivot
+    points without exploding the prompt.
+
+    Returns (evidence_text, included_node_ids). included_node_ids feeds
+    the traversal-log reinforcement and is the set of nodes that actually
+    made it into the prompt (not just into the seeds list).
+    """
+    storage = instance.storage
+    text_units = instance.text_units
+
+    # ---- Stage 1: collect candidate chunks across seeds (deduped). ----
+    # We need per-seed groupings AND a flat list for rerank.
+    seed_chunk_ids: dict[str, list[str]] = {}     # seed.id -> ordered chunk_ids that exist
+    chunk_payloads: dict[str, dict] = {}          # chunk_id -> chunk dict
+    for seed in seeds:
+        ids: list[str] = []
+        for cid in (getattr(seed, "text_unit_ids", None) or []):
+            cd = text_units.get(cid)
+            if cd is None:
+                continue
+            ids.append(cid)
+            chunk_payloads.setdefault(cid, cd)
+        seed_chunk_ids[seed.id] = ids
+
+    # ---- Stage 2: rerank chunks against the question by cosine. ----
+    # Embed once with the same sentence-transformers model that built FAISS
+    # (paraphrase-multilingual-MiniLM-L12-v2 — cross-lingual capable).
+    # On-the-fly chunk embedding cost ~5-20ms per chunk; for typical pools
+    # of 30-150 chunks this adds ~0.5-3s before the composer LLM call.
+    chunk_rank: dict[str, int] = {}   # chunk_id -> rerank position (0 = best)
+    all_chunk_ids = list(chunk_payloads.keys())
+    if all_chunk_ids:
+        from src.graph.retrieval import _get_model, encode_query
+        qv = encode_query(question)
+        model = _get_model()
+        chunk_texts = [
+            (chunk_payloads[cid].get("text", "") or "")
+            for cid in all_chunk_ids
+        ]
+        chunk_vecs = model.encode(
+            chunk_texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        # Cosine = dot (vectors normalized). Higher = more relevant.
+        scores = (chunk_vecs @ qv).tolist()
+        ranked = sorted(
+            zip(all_chunk_ids, scores),
+            key=lambda x: -x[1],
+        )
+        chunk_rank = {cid: i for i, (cid, _) in enumerate(ranked)}
+
+    # ---- Stage 3: select top-N chunks within token budget. ----
+    # Walk the rerank order, accept each chunk if it fits the remaining
+    # budget and we haven't hit top_n_chunks yet. Skip-don't-break on
+    # oversized chunks — a single 8K-token chunk shouldn't lock the rest
+    # out, the next candidate might fit. Cap by N OR by tokens, whichever
+    # hits first.
+    selected_chunk_ids: set[str] = set()
+    chunk_render_cache: dict[str, tuple[str, int]] = {}  # cid -> (rendered_text, token_count)
+    used_tokens = 0
+    for cid, _score in sorted(chunk_rank.items(), key=lambda x: x[1]):
+        if len(selected_chunk_ids) >= top_n_chunks:
+            break
+        cd = chunk_payloads[cid]
+        rid = cd.get("raw_doc_id", "") or ""
+        page = cd.get("page_num")
+        title = display_title(rid) if (use_display_title and rid) else rid
+        header = (
+            f'  [from "{title}", page {page}]'
+            if page is not None else f'  [from "{title}"]'
+        )
+        body = "  " + (cd.get("text", "") or "").strip()
+        rendered = header + "\n" + body
+        ct = count_tokens(rendered)
+        if used_tokens + ct > budget_tokens:
+            continue  # try next — a smaller one might still fit
+        chunk_render_cache[cid] = (rendered, ct)
+        selected_chunk_ids.add(cid)
+        used_tokens += ct
+
+    # ---- Stage 4: render entity-grouped EVIDENCE. ----
+    blocks: list[str] = []
+    included_ids: set[str] = set()
+    for seed in seeds:
+        block_lines = [
+            f"Entity: {seed.label} ({seed.type})",
+            f"Summary: {seed.summary}",
+        ]
+        surviving_for_seed = [
+            cid for cid in seed_chunk_ids.get(seed.id, [])
+            if cid in selected_chunk_ids
+        ]
+        # Order surviving chunks by rerank position so the most relevant
+        # passage appears first inside the seed block.
+        surviving_for_seed.sort(key=lambda cid: chunk_rank.get(cid, 1 << 30))
+        if surviving_for_seed:
+            block_lines.append("Sources:")
+            for cid in surviving_for_seed:
+                rendered, _ = chunk_render_cache[cid]
+                block_lines.append(rendered)
+        block_text = "\n".join(block_lines)
+        bt = count_tokens(block_text)
+        # Budget guard for the entity headers themselves (summary lines
+        # could push us over on a very tight budget). Stop adding seed
+        # blocks once headers alone would overflow.
+        if used_tokens + bt > budget_tokens and blocks:
+            break
+        blocks.append(block_text)
+        used_tokens += bt
+        included_ids.add(seed.id)
+
+    if include_neighbors:
+        seed_ids = {s.id for s in seeds}
+        neighbors = with_neighbors(storage, seeds)
+        nbr_lines: list[str] = []
+        for nb in neighbors:
+            if nb.id in seed_ids or nb.id in included_ids:
+                continue
+            prov = getattr(nb, "provenance", None)
+            rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
+            src = ""
+            if rid:
+                t = display_title(rid) if use_display_title else rid
+                src = f" (source: {t})"
+            line = f"- [{nb.type}] {nb.label}: {nb.summary}{src}"
+            lt = count_tokens(line)
+            if used_tokens + lt > budget_tokens:
+                break
+            nbr_lines.append(line)
+            used_tokens += lt
+            included_ids.add(nb.id)
+        if nbr_lines:
+            blocks.append("\nNEIGHBORS (context only, no full sources):\n" + "\n".join(nbr_lines))
+
+    text = "\n\n".join(blocks).strip()
+    return text or "(no evidence in working memory yet)", included_ids
 
 # Max tool-call iterations inside a single `agent.call()` (one user message).
 # Distinct from sleep-pass's MERGE_MAX_ITER — that's M4 convergence, this is
@@ -185,7 +366,14 @@ def _tool_schemas() -> dict[str, dict]:
             "type": "function",
             "function": {
                 "name": "show_provenance",
-                "description": "Show the provenance (source) of a specific node or edge given its ID.",
+                "description": (
+                    "Show the provenance and source-text excerpts for a "
+                    "specific node OR edge given its UUID. The result "
+                    "includes raw_doc_id, page numbers, and the verbatim "
+                    "page text the entity / relationship was extracted "
+                    "from — quote it directly to the user when they ask "
+                    "for a citation."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {"node_or_edge_id": {"type": "string", "description": "The UUID of the node or edge"}},
@@ -246,9 +434,12 @@ def _tool_schemas() -> dict[str, dict]:
                     "knowledge enters the graph — call it whenever the user "
                     "asks to load / import / ingest a file or document by name. "
                     "Supported formats: .txt, .md (read as UTF-8) and .pdf "
-                    "(text extracted via pdfplumber; long PDFs are auto-chunked by "
-                    "page with 2-page overlap, each chunk ingested as a "
-                    "separate raw_doc — the result reports per-chunk counts)."
+                    "(text extracted via pdfplumber). PDFs are processed page "
+                    "by page with cross-page entity carry-over and a "
+                    "second-pass relationship sweep. Documents longer than "
+                    "80 pages are auto-split into super-chunks (1-page "
+                    "overlap) and each super-chunk runs the full M1 pipeline; "
+                    "the result reports totals across the entire document."
                 ),
                 "parameters": {
                     "type": "object",
@@ -408,29 +599,19 @@ class GraphAgent:
         # behave consistently on follow-ups.
         history = getattr(self, "_turn_history", None) or []
         seed_q = _rewrite_query_with_history(self.client, q, history)
-        seeds = top_k(self.instance.vector_store, storage, seed_q, k=5)
-        nodes = with_neighbors(storage, seeds)
-        # Budget summaries only, ≤20k tiktoken (§12.5).
-        ctx_parts: list[str] = []
-        tok = 0
-        included_ids: set[str] = set()
-        for n in nodes:
-            # Thread the source document into the evidence line so the
-            # answer composer can cite it inline ("according to the FAO
-            # SOFIA 2024 report...") instead of reading off node IDs.
-            src = ""
-            prov = getattr(n, "provenance", None)
-            rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
-            if rid:
-                src = f" (source: {rid})"
-            line = f"- [{n.type}] {n.label}: {n.summary}{src}"
-            t = count_tokens(line)
-            if tok + t > RETRIEVAL_BUDGET_TOKENS:
-                break
-            ctx_parts.append(line)
-            tok += t
-            included_ids.add(n.id)
-        ctx = "\n".join(ctx_parts) or "(no evidence in working memory yet)"
+        # Task 1 (2026-05-11): widen entity recall to k=10 to feed the
+        # chunk reranker a larger pool. Chunks themselves are reranked by
+        # cosine against `seed_q` inside `_build_chunk_evidence`, then
+        # top-N (default 10) within the token budget make it to prompt.
+        # Neighbor expansion still runs (summary-only context for the
+        # agent loop's pivot decisions).
+        seeds = top_k(self.instance.vector_store, storage, seed_q, k=10)
+        ctx, included_ids = _build_chunk_evidence(
+            self.instance, seeds,
+            question=seed_q,
+            include_neighbors=True,
+            use_display_title=False,  # internal cites raw_doc_id directly
+        )
         # Log everything that made it into context — 4c uses this to reinforce.
         touched_edge_ids = [
             e.id for e in storage.edges()
@@ -447,13 +628,24 @@ class GraphAgent:
             messages=[
                 {"role": "system", "content": (
                     "You are a kelp / seaweed industry analyst answering the "
-                    "user's question using the evidence below. Each evidence "
-                    "item lists the source document it came from. Write in "
-                    "natural prose the way an industry analyst would — when "
-                    "you draw on a specific report, weave the source into "
-                    "the sentence (e.g., \"according to the State of the "
-                    "Kelp Industry Report...\"). Drop the .pdf suffix and "
-                    "any #pages_... fragment when naming a source.\n\n"
+                    "user's question using the evidence below. The evidence "
+                    "is grouped per entity: each block has the entity name "
+                    "and type, a brief summary, and one or more verbatim "
+                    "Sources passages from named documents. Quote and cite "
+                    "from the verbatim passages whenever specific facts "
+                    "(numbers, dates, exact phrasing) are relevant — they "
+                    "are the authoritative version. Write in natural prose "
+                    "the way an industry analyst would; when you draw on a "
+                    "specific report, weave the source title into the "
+                    "sentence (e.g., \"according to the State of the Kelp "
+                    "Industry Report...\"). Drop any .pdf suffix when "
+                    "naming a source.\n\n"
+                    "After the per-entity blocks you may see a NEIGHBORS "
+                    "section listing 1-hop graph neighbors with summaries "
+                    "only (no source passages). Use neighbors as context "
+                    "to spot related entities you might want to reason "
+                    "about — but do NOT cite specific facts from a "
+                    "neighbor's summary as if it were primary evidence.\n\n"
                     "Strict grounding rule: answer ONLY from the evidence "
                     "below. Do NOT add facts you happen to know from prior "
                     "training — even widely-known facts about companies, "
@@ -484,11 +676,68 @@ class GraphAgent:
         }
 
     def _impl_show_provenance(self, args: dict) -> dict:
+        """Return provenance for a node OR an edge (§16.8.4 + §16.17.6).
+
+        For both kinds, resolve any text_unit_ids back to the verbatim
+        chunk text so the agent can quote it directly to the user without
+        needing a separate fetch tool. For edges this also surfaces the
+        evidence_quote if PASS 2 emitted one.
+        """
         tgt = str(args.get("node_or_edge_id", ""))
         n = self.instance.storage.get_node(tgt)
         if n is not None:
-            return {"kind": "node", "id": n.id, "provenance": n.provenance.model_dump()}
+            payload = {
+                "kind": "node",
+                "id": n.id,
+                "label": n.label,
+                "type": n.type,
+                "provenance": n.provenance.model_dump(),
+            }
+            sources = self._resolve_text_units(n.text_unit_ids)
+            if sources:
+                payload["sources"] = sources
+            return payload
+
+        e = self.instance.storage.get_edge(tgt)
+        if e is not None:
+            src_node = self.instance.storage.get_node(e.source_id)
+            tgt_node = self.instance.storage.get_node(e.target_id)
+            payload = {
+                "kind": "edge",
+                "id": e.id,
+                "type": e.type,
+                "source": {
+                    "id": e.source_id,
+                    "label": src_node.label if src_node else None,
+                },
+                "target": {
+                    "id": e.target_id,
+                    "label": tgt_node.label if tgt_node else None,
+                },
+                "provenance": e.provenance.model_dump(),
+            }
+            if e.evidence_quote:
+                payload["evidence_quote"] = e.evidence_quote
+            sources = self._resolve_text_units(e.text_unit_ids)
+            if sources:
+                payload["sources"] = sources
+            return payload
+
         return {"kind": "not_found", "id": tgt}
+
+    def _resolve_text_units(self, chunk_ids: list[str]) -> list[dict]:
+        """Map chunk_ids → list of {raw_doc_id, page_num, text} dicts. Used
+        by show_provenance to inline the source text into its result."""
+        if not chunk_ids:
+            return []
+        out: list[dict] = []
+        for cd in self.instance.text_units.get_many(chunk_ids):
+            out.append({
+                "raw_doc_id": cd.get("raw_doc_id", ""),
+                "page_num": cd.get("page_num"),
+                "text": cd.get("text", ""),
+            })
+        return out
 
     def _impl_read_ontology(self, args: dict) -> dict:
         p = Path(self.instance.ontology_path)
@@ -524,44 +773,14 @@ class GraphAgent:
             })
         return {"files": files, "count": len(files)}
 
-    @staticmethod
-    def _plan_pdf_chunks(
-        page_tokens: list[int], cap: int, overlap: int,
-    ) -> list[tuple[int, int]]:
-        """Greedy page-pack into chunks with `overlap`-page tail repeat.
-
-        Returns list of (start, end_exclusive) page indices. A page that
-        on its own exceeds `cap` becomes a single-page chunk (M1 will then
-        raise — caller surfaces the error per-chunk rather than silently
-        truncating).
-        """
-        n = len(page_tokens)
-        chunks: list[tuple[int, int]] = []
-        i = 0
-        while i < n:
-            end = i
-            running = 0
-            while end < n and (end == i or running + page_tokens[end] <= cap):
-                # First page of the chunk goes in unconditionally so a single
-                # oversize page doesn't get skipped — M1 will raise on it.
-                running += page_tokens[end]
-                end += 1
-                if end == i + 1 and running > cap:
-                    # Single page already over cap; close chunk here.
-                    break
-            chunks.append((i, end))
-            if end >= n:
-                break
-            i = max(end - overlap, i + 1)
-        return chunks
-
     def _impl_ingest_file(self, args: dict) -> dict:
-        """Read data/raw/<basename> and ingest it via M1 (DirectProv).
+        """Read data/raw/<basename> and ingest it via M1 (§16.17).
 
-        Path traversal is prevented by reducing to `basename` and then
+        Path traversal is prevented by reducing to ``basename`` and then
         asserting the resolved path sits inside the data/raw/ directory.
-        Long PDFs are auto-chunked by page with INGEST_PDF_PAGE_OVERLAP-page
-        overlap; each chunk ingests as its own raw_doc.
+        PDFs are split per page; non-paginated text formats become a
+        single-element pages list. M1's ingest_document handles the
+        two-pass extraction internally — no chunk planning happens here.
         """
         raw_arg = str(args.get("filename", "")).strip()
         if not raw_arg:
@@ -619,9 +838,8 @@ class GraphAgent:
                 text = target.read_text(encoding="utf-8")
             except UnicodeDecodeError as exc:
                 return {"error": f"could not read as utf-8: {exc}"}
-            return self._ingest_single(basename, ext, text)
-
-        if ext in self._RAW_PDF_EXTS:
+            pages = [text]
+        elif ext in self._RAW_PDF_EXTS:
             try:
                 import logging
                 # pdfminer.six (pdfplumber's backend) spams "Could not get
@@ -635,76 +853,127 @@ class GraphAgent:
                 return {"error": f"could not extract text from PDF: {exc}"}
             if not any(p.strip() for p in pages):
                 return {"error": f"PDF contained no extractable text (likely scanned/image-only): {basename}"}
-
-            page_tokens = [count_tokens(p) for p in pages]
-            total_tokens = sum(page_tokens)
-
-            if total_tokens <= INGEST_INPUT_MAX_TOKENS:
-                text = "\n\n".join(pages).strip()
-                return self._ingest_single(basename, ext, text, total_pages=len(pages))
-
-            chunk_ranges = self._plan_pdf_chunks(
-                page_tokens, INGEST_INPUT_MAX_TOKENS, INGEST_PDF_PAGE_OVERLAP,
-            )
-            chunk_results: list[dict] = []
-            totals = {"nodes_added": 0, "edges_added": 0, "edges_skipped": 0}
-            for start, end in chunk_ranges:
-                chunk_text = "\n\n".join(pages[start:end]).strip()
-                chunk_doc_id = f"{basename}#pages_{start + 1}_{end}"
-                entry: dict = {
-                    "raw_doc_id": chunk_doc_id,
-                    "page_range": [start + 1, end],
-                    "tokens": sum(page_tokens[start:end]),
-                }
-                try:
-                    res = self.instance.ingest(chunk_text, raw_doc_id=chunk_doc_id)
-                    entry.update({
-                        "status": "ok",
-                        "run_id": res.run_id,
-                        "nodes_added": res.nodes_added,
-                        "edges_added": res.edges_added,
-                        "edges_skipped": res.edges_skipped,
-                    })
-                    if res.extraction_warning:
-                        entry["extraction_warning"] = res.extraction_warning
-                    if res.finish_reason and res.finish_reason != "stop":
-                        entry["finish_reason"] = res.finish_reason
-                    totals["nodes_added"] += res.nodes_added
-                    totals["edges_added"] += res.edges_added
-                    totals["edges_skipped"] += res.edges_skipped
-                except Exception as exc:
-                    entry.update({"status": "error", "error": str(exc)})
-                chunk_results.append(entry)
-            self.instance.save()
-            ok_count = sum(1 for c in chunk_results if c.get("status") == "ok")
+        else:
             return {
-                "status": "ok" if ok_count == len(chunk_results) else "partial",
-                "filename": basename,
-                "extension": ext,
-                "chunked": True,
-                "total_pages": len(pages),
-                "total_tokens": total_tokens,
-                "chunks_processed": ok_count,
-                "chunks_total": len(chunk_results),
-                "page_overlap": INGEST_PDF_PAGE_OVERLAP,
-                "total_nodes_added": totals["nodes_added"],
-                "total_edges_added": totals["edges_added"],
-                "total_edges_skipped": totals["edges_skipped"],
-                "chunks": chunk_results,
+                "error": (
+                    f"unsupported file extension {ext!r}; "
+                    f"supported: {sorted(self._RAW_TEXT_EXTS | self._RAW_PDF_EXTS)}"
+                )
             }
 
+        # §16.17 super-chunk wrapper (2026-05-10): a 200-page PDF would
+        # blow up M1's `prior_entities_block` past the 128K context
+        # window in late PASS 1 / all of PASS 2. Slice anything bigger
+        # than INGEST_SUPERCHUNK_MAX_PAGES into bounded super-chunks
+        # with a 1-page overlap; each runs the full M1 pipeline as if
+        # it were its own document. Cross-super-chunk same-entity
+        # duplicates are accepted and resolved by M4b sleep pass.
+        if len(pages) <= INGEST_SUPERCHUNK_MAX_PAGES:
+            return self._ingest_pages(basename, ext, pages)
+        return self._ingest_pages_split(basename, ext, pages)
+
+    @staticmethod
+    def _plan_superchunks(
+        n_pages: int, max_pages: int, overlap: int,
+    ) -> list[tuple[int, int]]:
+        """Produce half-open page ranges (start, end) covering ``n_pages``.
+
+        Each range has at most ``max_pages`` pages; consecutive ranges
+        share ``overlap`` pages on the boundary. Empty input → empty list.
+        For ``n_pages <= max_pages`` returns a single range covering all.
+
+        Examples (max=80, overlap=1):
+            n=80   → [(0, 80)]
+            n=81   → [(0, 80), (79, 81)]
+            n=200  → [(0, 80), (79, 159), (158, 200)]
+        """
+        if n_pages <= 0:
+            return []
+        if n_pages <= max_pages:
+            return [(0, n_pages)]
+        step = max(1, max_pages - overlap)
+        chunks: list[tuple[int, int]] = []
+        start = 0
+        while start < n_pages:
+            end = min(start + max_pages, n_pages)
+            chunks.append((start, end))
+            if end >= n_pages:
+                break
+            start += step
+        return chunks
+
+    def _ingest_pages_split(
+        self, basename: str, ext: str, pages: list[str],
+    ) -> dict:
+        """Run M1 over a long PDF in bounded super-chunks. Each super-chunk
+        becomes its own ``raw_doc_id`` (``basename#pages_X_Y``) so chunks
+        and provenance can be attributed back to the source slice. Stats
+        are summed across super-chunks; per-super-chunk detail is also
+        returned for audit. Failures of one super-chunk are logged and
+        skipped — the rest still run."""
+        ranges = self._plan_superchunks(
+            len(pages),
+            INGEST_SUPERCHUNK_MAX_PAGES,
+            INGEST_SUPERCHUNK_OVERLAP_PAGES,
+        )
+        per_chunk: list[dict] = []
+        totals = {
+            "pages_processed": 0, "nodes_added": 0, "edges_added": 0,
+            "edges_skipped": 0, "pass2_edges_added": 0,
+            "pass2_edges_dropped": 0, "nodes_fused": 0,
+            "edges_reclassified": 0, "edges_reclassified_kept": 0,
+            "duplicate_edges_removed": 0,
+        }
+        ok_count = 0
+        for start, end in ranges:
+            sub_pages = pages[start:end]
+            sub_doc_id = f"{basename}#pages_{start + 1}_{end}"
+            try:
+                result = self.instance.ingest(sub_pages, raw_doc_id=sub_doc_id)
+                self.instance.save()
+            except Exception as exc:
+                per_chunk.append({
+                    "raw_doc_id": sub_doc_id,
+                    "page_range": [start + 1, end],
+                    "status": "error",
+                    "error": str(exc),
+                })
+                continue
+            ok_count += 1
+            per_chunk.append({
+                "raw_doc_id": sub_doc_id,
+                "page_range": [start + 1, end],
+                "status": "ok",
+                "run_id": result.run_id,
+                "pages_processed": result.pages_processed,
+                "nodes_added": result.nodes_added,
+                "edges_added": result.edges_added,
+                "pass2_edges_added": result.pass2_edges_added,
+                "edges_reclassified": result.edges_reclassified,
+                "duplicate_edges_removed": result.duplicate_edges_removed,
+                "nodes_fused": result.nodes_fused,
+            })
+            for k in totals:
+                totals[k] += getattr(result, k, 0)
+
         return {
-            "error": (
-                f"unsupported file extension {ext!r}; "
-                f"supported: {sorted(self._RAW_TEXT_EXTS | self._RAW_PDF_EXTS)}"
-            )
+            "status": "ok" if ok_count == len(ranges) else "partial",
+            "filename": basename,
+            "extension": ext,
+            "split_into_superchunks": len(ranges),
+            "superchunks_ok": ok_count,
+            "total_pages": len(pages),
+            "page_overlap": INGEST_SUPERCHUNK_OVERLAP_PAGES,
+            "superchunk_max_pages": INGEST_SUPERCHUNK_MAX_PAGES,
+            **totals,
+            "superchunks": per_chunk,
         }
 
-    def _ingest_single(
-        self, basename: str, ext: str, text: str, *, total_pages: int | None = None,
-    ) -> dict:
+    def _ingest_pages(self, basename: str, ext: str, pages: list[str]) -> dict:
+        """Run M1 on a pages list (§16.17). Single result shape regardless
+        of whether the source is multi-page PDF or single-blob text."""
         try:
-            result = self.instance.ingest(text, raw_doc_id=basename)
+            result = self.instance.ingest(pages, raw_doc_id=basename)
         except Exception as exc:
             return {"error": f"ingest failed: {exc}"}
         self.instance.save()
@@ -712,18 +981,20 @@ class GraphAgent:
             "status": "ok",
             "filename": basename,
             "extension": ext,
-            "chunked": False,
             "run_id": result.run_id,
+            "pages_processed": result.pages_processed,
             "nodes_added": result.nodes_added,
             "edges_added": result.edges_added,
             "edges_skipped": result.edges_skipped,
+            "pass2_edges_added": result.pass2_edges_added,
+            "pass2_edges_dropped": result.pass2_edges_dropped,
+            "nodes_fused": result.nodes_fused,
+            "edges_reclassified": result.edges_reclassified,
+            "edges_reclassified_kept": result.edges_reclassified_kept,
+            "duplicate_edges_removed": result.duplicate_edges_removed,
         }
-        if total_pages is not None:
-            out["total_pages"] = total_pages
-        if result.extraction_warning:
-            out["extraction_warning"] = result.extraction_warning
-        if result.finish_reason and result.finish_reason != "stop":
-            out["finish_reason"] = result.finish_reason
+        if result.page_warnings:
+            out["page_warnings"] = result.page_warnings
         return out
 
     # -- Public API --
@@ -987,184 +1258,65 @@ class GraphAgent:
 
 
 # ---------------------------------------------------------------------------
-# External fast-query path (§16.9.2 / §16.9.4 / §16.9.5)
+# External fast-query path (§16.9.2 / §16.9.4)
 # ---------------------------------------------------------------------------
 #
 # External role gets:
 #   - top_k FAISS retrieval only (NO with_neighbors expansion — that's the
 #     internal "from-graph" superpower per §16.9 trade-off)
-#   - one composer LLM call with thinking=False
+#   - chunk-level rerank against the question (task 1, 2026-05-11)
+#   - one composer LLM call with thinking=False, streamed raw to the UI
 #   - human-readable source titles via display_title (no raw filenames)
-#   - aggressive output scrub for any path / extension / tool-name /
-#     UUID / internal jargon that leaks despite the prompt rules
 #
 # The agent loop is bypassed entirely. No tools are exposed to external
 # users — the module deliberately doesn't construct a GraphAgent at all
-# in external mode (Streamlit calls fast_query directly).
+# in external mode (Streamlit calls fast_query_stream directly). Output
+# safety relies entirely on EXTERNAL_COMPOSER_SYSTEM_PROMPT and on the
+# fact that the prompt never contains internal jargon to begin with
+# (display_title strips filenames; no tool definitions enter scope).
+# The earlier regex-based scrub and corpus-enumeration filters were
+# removed in task 2 (2026-05-11) because they (a) broke markdown
+# rendering by buffering tokens at sentence boundaries and (b) defended
+# only against LLM hallucinations of RAG-shaped strings that weren't
+# real leaks anyway.
 
 EXTERNAL_COMPOSER_SYSTEM_PROMPT = (
     "You are a kelp / seaweed industry analyst answering the user's "
-    "question using the evidence below. Each evidence item lists the "
-    "source it came from. Write in natural prose the way an industry "
-    "analyst would — when you draw on a specific report, weave the "
-    "source into the sentence (e.g., \"according to the State of the "
-    "Kelp Industry Report\"). \n\n"
-    "Hard rules — never violate:\n"
-    "1. Do NOT mention file paths, file names, file extensions, internal "
-    "IDs (UUIDs, hashes), or any tool / function name. The user does not "
-    "have access to any backend tooling.\n"
-    "2. When citing a source, use only its human-readable title (already "
-    "provided in the evidence as `source: <title>`). Never include `.pdf` "
-    "or technical fragments like `#pages_X_Y`.\n"
-    "3. If the user asks about ingestion, indexing, maintenance, system "
-    "internals, or anything outside of industry knowledge, reply: \"I "
-    "don't have information on that.\" Do NOT acknowledge that any such "
-    "functionality exists or might exist.\n"
-    "4. If the evidence does not contain enough information to answer, "
-    "decline briefly in the voice of an expert who simply doesn't track "
-    "that topic — e.g., \"I don't have specific data on that\" or \"that's "
-    "outside what I follow.\" Then STOP. Do NOT speculate. Do NOT direct "
-    "the user to \"ask again later\" or \"contact an admin.\" Critically: "
-    "do NOT enumerate what topics, regions, or reports your information "
-    "DOES cover — phrasings like \"我所掌握的资料主要集中在...\", \"我的"
-    "现有资料覆盖...\", \"my information mainly focuses on...\", \"my "
-    "evidence covers X but not Y\" reveal that you are reading from a "
-    "curated database. A domain expert just declines and stops.\n"
-    "    Topic-mismatch case: when judging \"enough information,\" judge "
-    "against what the user is asking IN CONVERSATION CONTEXT, not just "
-    "the literal current message. If the conversation has been about the "
-    "kelp / seaweed industry and the user asks a deictic follow-up like "
-    "\"中国呢\" / \"what about China?\" / \"那美国呢\", they're asking "
-    "about THAT TOPIC for the new entity (China's kelp industry, US's "
-    "kelp industry). If your evidence has data about China in a different "
-    "context (e.g., general aquaculture, capture fisheries) but nothing "
-    "kelp-specific, that is a topic mismatch — DECLINE rather than pivot "
-    "silently to the off-topic data. The user reads every reply as a "
-    "continuation of the same thread and will infer the off-topic answer "
-    "is on-topic. Honest decline: \"I don't have specific information on "
-    "China's kelp industry\" — and stop.\n"
-    "5. You are a person — an analyst — not a system. Never refer to your "
-    "knowledge as \"my corpus\", \"my materials\", \"my information\", "
-    "\"my evidence\", \"my data\", \"the documents I have access to\", "
-    "\"我的资料\", \"我的知识库\", \"现有资料\", or anything similar. "
-    "If you must explain a limit, use language an industry analyst would "
-    "use about their own expertise (\"I don't track that closely\", "
-    "\"that's outside my coverage area\").\n"
-    "6. Answer ONLY from the evidence provided below. Do NOT add facts "
-    "you happen to know from prior training — not even widely-known ones "
-    "(company headquarters, product launches, regulatory dates, "
-    "geographic facts about countries / regions). The user has no way "
-    "to audit prior-training claims, so they are indistinguishable from "
-    "fabrication. Mixing prior-training facts with evidence-grounded "
-    "facts in the same answer is a hard violation, even when both are "
-    "true: the user reads them as one stream and cannot tell which is "
-    "which. If evidence covers part of the question and not the rest, "
-    "answer the covered part using evidence and decline the rest "
-    "(rule 4) — do NOT pad."
+    "question using the evidence below. The evidence is grouped per "
+    "entity — each block has the entity name, a short summary, and one "
+    "or more verbatim Sources passages from named reports. The Sources "
+    "passages are authoritative; lean on them for specifics (numbers, "
+    "dates, exact phrasing). Write in natural prose the way an analyst "
+    "would — when you draw on a specific report, weave the source title "
+    "into the sentence (e.g., \"according to the State of the Kelp "
+    "Industry Report\").\n\n"
+    "Strict grounding — answer ONLY from the evidence below. Do not add "
+    "facts from prior training, even widely-known ones (company HQs, "
+    "product launches, regulatory dates, geographic facts about "
+    "countries / regions). The user has no way to audit prior-training "
+    "claims, so they are indistinguishable from fabrication. If the "
+    "evidence is insufficient, decline plainly in an analyst's voice "
+    "(\"I don't have specific data on that\", \"that's outside what I "
+    "track\") and stop. Do not speculate. Do not suggest the user ask "
+    "again later or contact an admin. If evidence covers part of the "
+    "question and not the rest, answer the covered part and decline the "
+    "rest — do not pad.\n\n"
+    "Topic-mismatch on follow-ups — judge \"enough information\" against "
+    "the conversation context, not just the literal current message. If "
+    "the thread has been about the kelp / seaweed industry and the user "
+    "asks a deictic follow-up like \"中国呢\" / \"what about China?\" / "
+    "\"那美国呢\", they're asking about THAT topic for the new entity "
+    "(China's kelp industry, US's kelp industry). If your evidence has "
+    "data about China only in a different context (general aquaculture, "
+    "capture fisheries) but nothing kelp-specific, that's a topic "
+    "mismatch — decline rather than pivot silently to the off-topic "
+    "data.\n\n"
+    "Persona — you are an analyst, not a system. Don't describe your "
+    "knowledge as \"my corpus\" / \"my materials\" / \"my information\" / "
+    "\"the documents I have access to\" / \"我的资料\" / \"我的知识库\". "
+    "If you must explain a limit, frame it as personal expertise coverage "
+    "(\"I don't track that closely\", \"that's outside my coverage area\")."
 )
-
-# Bare regex patterns for output scrub — final safety net if the LLM
-# violates a Hard Rule despite the system prompt.
-_SCRUB_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # Project paths
-    (re.compile(r"\bdata/(raw|production|experiment|m1_failures|snapshots)/?\b", re.I), "(unspecified source)"),
-    # File extensions glued to a word (PDF / TXT / MD)
-    (re.compile(r"(\w)\.(pdf|txt|md|markdown)\b", re.I), r"\1"),
-    # Chunk fragment
-    (re.compile(r"#pages_\d+_\d+", re.I), ""),
-    # Tool / impl names
-    (re.compile(
-        r"\b(ingest_file|list_raw_files|trigger_sleep_pass|show_provenance|"
-        r"mark_stale|read_ontology|graph_query|get_graph_stats|"
-        r"list_recent_(?:merges|prunings)|run_plant_recover_eval|"
-        r"compare_with_baseline)\b", re.I,
-    ), "the system"),
-    # UUIDs (8-4-4-4-12 hex)
-    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), ""),
-    # Internal jargon
-    (re.compile(r"\b(raw_doc_id|provenance|sleep[ -]?pass|merge candidate|fused node|extraction_run_id)\b", re.I), ""),
-]
-
-
-# Sentences that betray "I'm reading from a curated corpus" — observed
-# 2026-05-06 in external chat: when LLM declined ("I don't know about US"),
-# it tacked on "我的资料主要集中在中国 / 全球渔业 / 北美海藻产业" which
-# IS a corpus enumeration. The rules in EXTERNAL_COMPOSER_SYSTEM_PROMPT
-# now forbid this, but Gemma 4 still slips. These regexes match the entire
-# offending sentence (until period / Chinese full stop / line break / end)
-# and delete it cleanly so the polite decline survives.
-_CORPUS_ENUMERATION_PATTERNS: list[re.Pattern] = [
-    # Chinese — "我所掌握的资料主要集中在...", "我的现有资料覆盖...",
-    # "我能找到的信息主要是...", "我的知识库..."
-    # Sentence boundary uses Chinese full stop 。 / 、(no, 、 is comma)
-    # / newline ONLY — embedded English abbreviation periods like "Inc."
-    # must NOT terminate the match. Comma 。 is NOT 。 (comma vs period).
-    re.compile(
-        r"我[的所]?(掌握|现有|可获取|拥有|能找到|目前)的?(资料|信息|数据|知识|文献|文档|材料|内容)"
-        r"[^。\n]*[。\n]?",
-    ),
-    re.compile(r"我的(知识库|资料库|信息库|数据库)[^。\n]*[。\n]?"),
-    re.compile(r"现有(的)?(资料|信息|数据)[^。\n]*[。\n]?"),
-    # English — "my materials/corpus/information/evidence/data
-    # mainly|primarily|focus|cover|are about ..."
-    # English sentence terminator: . ! ? followed by whitespace/EOL, OR
-    # newline. Bare "." inside abbreviations like "U.S." won't match
-    # because they're not followed by whitespace.
-    re.compile(
-        r"\b(my|the)\s+(materials?|corpus|information|knowledge\s*base|"
-        r"evidence|data|documents?|sources?|records?)\s+"
-        r"(mainly|primarily|chiefly|cover|covers|focus(?:es)?|"
-        r"are\s+about|is\s+about|center|centers?|"
-        r"contain|contains|include|includes)"
-        r"[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
-        re.I,
-    ),
-    # English — "the materials I have access to mainly focus on..."
-    re.compile(
-        r"\bthe\s+(materials?|information|evidence|data|documents?)\s+"
-        r"I\s+(have|can)\s+access(\s+to)?[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
-        re.I,
-    ),
-    # English — "what I have access to ..."
-    re.compile(
-        r"\bwhat\s+I\s+(have|can)\s+(access|find|see|tell)"
-        r"[^.!?\n]*(?:[.!?](?=\s|\Z)|\n|\Z)",
-        re.I,
-    ),
-]
-
-
-def _strip_corpus_enumerations(text: str) -> str:
-    """Remove sentences that enumerate corpus contents. Order-dependent
-    with the main scrub: this runs first so the regex sees the original
-    LLM output (path / tool-name scrubs would otherwise damage the
-    trigger phrases before this runs)."""
-    cleaned = text or ""
-    for pattern in _CORPUS_ENUMERATION_PATTERNS:
-        cleaned = pattern.sub("", cleaned)
-    return cleaned
-
-
-def _scrub_external_output(text: str) -> str:
-    """Apply the safety-net scrub to text destined for an external user.
-
-    Only run on external mode — internal users see the raw output for
-    debugging purposes. Multiple-substitution loop handles cases where
-    the first pass leaves residue that a later pattern cleans up.
-
-    Order matters: corpus-enumeration patterns run first because they
-    target full sentences that other (token-level) scrubs would damage.
-    """
-    cleaned = text or ""
-    cleaned = _strip_corpus_enumerations(cleaned)
-    for pattern, replacement in _SCRUB_PATTERNS:
-        cleaned = pattern.sub(replacement, cleaned)
-    # Collapse any runs of whitespace introduced by removals.
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r" +([,.;:!?])", r"\1", cleaned)
-    # Empty paragraphs left behind by sentence deletion.
-    cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
-    return cleaned.strip()
 
 
 _REWRITE_SYSTEM_PROMPT = (
@@ -1279,7 +1431,9 @@ def fast_query(
          the model can resolve deictic references and follow the
          conversation thread, just like internal mode does.
 
-    Returns the answer text scrubbed for external safety.
+    `mode` is kept for callers that haven't migrated to the stream path;
+    behaviour is identical for `external` and `internal` since the
+    output scrub was removed in task 2 (2026-05-11).
     """
     storage = instance.storage
     client = get_client("backend")
@@ -1287,27 +1441,16 @@ def fast_query(
     # ask the model to fold history + follow-up into a standalone query.
     # ~1-2s with thinking=False; falls back to raw question on failure.
     seed_query = _rewrite_query_with_history(client, question, history)
-    seeds = top_k(instance.vector_store, storage, seed_query, k=5)
-    # External path INTENTIONALLY omits with_neighbors — vector retrieval
-    # only, no graph traversal. See §16.9.2 design table.
-
-    ctx_parts: list[str] = []
-    tok = 0
-    included_ids: set[str] = set()
-    for n in seeds:
-        prov = getattr(n, "provenance", None)
-        rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
-        # Use human title in evidence so the LLM never sees the raw filename.
-        title = display_title(rid) if rid else None
-        src = f" (source: {title})" if title else ""
-        line = f"- [{n.type}] {n.label}: {n.summary}{src}"
-        t = count_tokens(line)
-        if tok + t > RETRIEVAL_BUDGET_TOKENS:
-            break
-        ctx_parts.append(line)
-        tok += t
-        included_ids.add(n.id)
-    ctx = "\n".join(ctx_parts) or "(no evidence)"
+    # Task 1: widen entity recall to k=10 so the chunk reranker has a
+    # bigger pool to choose from. Chunks themselves are scored against
+    # `seed_query` inside `_build_chunk_evidence`.
+    seeds = top_k(instance.vector_store, storage, seed_query, k=10)
+    ctx, included_ids = _build_chunk_evidence(
+        instance, seeds,
+        question=seed_query,
+        include_neighbors=False,
+        use_display_title=True,
+    )
 
     # Reinforce traversal log even for external — these are real queries
     # that should bump weights on touched nodes/edges in the next pass.
@@ -1337,51 +1480,7 @@ def fast_query(
         temperature=0.2,
         thinking=False,  # ~15× speedup for external; accuracy matters less than latency
     )
-    raw = resp.choices[0].message.content or ""
-
-    if mode == "external":
-        return _scrub_external_output(raw) or "I don't have information on that."
-    return raw
-
-
-# ---------------------------------------------------------------------------
-# Buffered streaming scrub (§16.15.3)
-# ---------------------------------------------------------------------------
-
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s|(?<=\n)")
-
-_FLUSH_BUFFER_LIMIT = 200
-
-
-def _buffered_scrub_stream(token_iter: Iterator[str]) -> Iterator[str]:
-    """Scrub streaming tokens through ``_scrub_external_output`` at sentence
-    boundaries.  Yields cleaned sentence chunks as they complete.
-
-    Tokens accumulate in a buffer.  When a sentence boundary is detected the
-    completed portion is scrubbed and yielded.  A hard limit flushes the
-    buffer even without a boundary (unlikely but safe).
-    """
-    buf = ""
-    for token in token_iter:
-        buf += token
-        while True:
-            m = _SENTENCE_BOUNDARY.search(buf)
-            if m is None:
-                if len(buf) >= _FLUSH_BUFFER_LIMIT:
-                    cleaned = _scrub_external_output(buf)
-                    if cleaned:
-                        yield cleaned
-                    buf = ""
-                break
-            sentence = buf[: m.end()]
-            buf = buf[m.end() :]
-            cleaned = _scrub_external_output(sentence)
-            if cleaned:
-                yield cleaned
-    if buf:
-        cleaned = _scrub_external_output(buf)
-        if cleaned:
-            yield cleaned
+    return resp.choices[0].message.content or "I don't have information on that."
 
 
 def fast_query_stream(
@@ -1391,32 +1490,24 @@ def fast_query_stream(
     mode: str = "external",
     history: list[dict] | None = None,
 ) -> Iterator[str]:
-    """Streaming variant of :meth:`fast_query` (§16.15.3).
+    """Streaming variant of :meth:`fast_query`.
 
     Retrieval and evidence assembly happen synchronously (fast — no LLM),
-    then the composer call streams through the buffered scrub.
+    then the composer call streams tokens straight through to the UI.
+    Tokens are yielded raw so markdown rendering in the front-end stays
+    atomic (sentence-buffered scrubbing was removed in task 2).
     """
     storage = instance.storage
     client = get_client("backend")
     seed_query = _rewrite_query_with_history(client, question, history)
-    seeds = top_k(instance.vector_store, storage, seed_query, k=5)
-
-    ctx_parts: list[str] = []
-    tok = 0
-    included_ids: set[str] = set()
-    for n in seeds:
-        prov = getattr(n, "provenance", None)
-        rid = getattr(prov, "raw_doc_id", None) if prov is not None else None
-        title = display_title(rid) if rid else None
-        src = f" (source: {title})" if title else ""
-        line = f"- [{n.type}] {n.label}: {n.summary}{src}"
-        t = count_tokens(line)
-        if tok + t > RETRIEVAL_BUDGET_TOKENS:
-            break
-        ctx_parts.append(line)
-        tok += t
-        included_ids.add(n.id)
-    ctx = "\n".join(ctx_parts) or "(no evidence)"
+    # Task 1: same widened entity recall + chunk rerank as fast_query.
+    seeds = top_k(instance.vector_store, storage, seed_query, k=10)
+    ctx, included_ids = _build_chunk_evidence(
+        instance, seeds,
+        question=seed_query,
+        include_neighbors=False,
+        use_display_title=True,
+    )
 
     touched_edge_ids = [
         e.id for e in storage.edges()
@@ -1439,16 +1530,10 @@ def fast_query_stream(
         {"role": "user", "content": f"EVIDENCE:\n{ctx}\n\nQUESTION: {question}"},
     )
 
-    def _raw_tokens() -> Iterator[str]:
-        for event in client.chat_stream(
-            messages=composer_messages,
-            temperature=0.2,
-            thinking=False,
-        ):
-            if event.token:
-                yield event.token
-
-    if mode == "external":
-        yield from _buffered_scrub_stream(_raw_tokens())
-    else:
-        yield from _raw_tokens()
+    for event in client.chat_stream(
+        messages=composer_messages,
+        temperature=0.2,
+        thinking=False,
+    ):
+        if event.token:
+            yield event.token

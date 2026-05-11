@@ -76,6 +76,12 @@ class Node(BaseModel):
     version: int = 1
     provenance: Provenance
 
+    # §16.17 source-text linkage. Populated at M1 extraction time with the
+    # chunk_ids the entity was identified from; M4b merge takes the union
+    # across the two merged nodes. Empty list is legal for legacy/migrated
+    # records (handled by the boot consistency check).
+    text_unit_ids: list[str] = Field(default_factory=list)
+
     # Mark-stale (logic in M4)
     suspicious: bool = False
     suspicious_pass_count: int = 0
@@ -99,3 +105,11 @@ class Edge(BaseModel):
 
     suspicious: bool = False
     suspicious_pass_count: int = 0
+
+    # §16.17 source-text linkage. M1 PASS 1 / PASS 2 inject the chunk_id the
+    # relationship was extracted from; M4d reinforce / M4b merge take unions.
+    text_unit_ids: list[str] = Field(default_factory=list)
+    # §16.17 audit + anti-hallucination guard. Verbatim phrase from the source
+    # chunk that supports this relationship. PASS 2 sanity-checks LLM output by
+    # fuzzy-matching this against the chunk text. PASS 1 may leave it empty.
+    evidence_quote: str = ""
