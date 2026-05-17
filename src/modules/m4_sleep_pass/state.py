@@ -53,6 +53,11 @@ class PassState(TypedDict, total=False):
     merge_iter: int
     merge_done_vote: bool
     merged_new_ids: Annotated[list[str], operator.add]
+    # Per-pass set of pair keys (sorted "id1|id2") that the LLM judge
+    # already said "different" about. Skipped on subsequent rounds —
+    # candidate pool is deterministic in node ids so re-asking would
+    # just burn the same answer.
+    merge_rejected_pairs: Annotated[list[str], operator.add]
     # prune-round state
     prune_iter: int
     prune_changed: bool

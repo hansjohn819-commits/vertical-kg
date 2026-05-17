@@ -420,9 +420,23 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
     merged_ids: list[str] = []
     verdicts = {"same": 0, "different": 0, "same_with_caveats": 0, "error": 0}
 
+    # Carry per-pass memory of already-rejected pairs. A pair the judge
+    # said "different" about won't change its mind on the same inputs;
+    # skipping shortens later rounds from "re-judge everything" to
+    # "judge only what the merge state actually changed". Without this
+    # an N-round pass redoes the same ~200 LLM calls each round when
+    # nothing merges (observed: 2 × 18 min = 36 min wasted, 2026-05-17).
+    already_rejected = set(state.get("merge_rejected_pairs") or [])
+    new_rejections: list[str] = []
+    skipped_already_rejected = 0
+
     for a, b in [(p[0], p[1]) for p in pairs]:
         # Skip if either side got merged earlier in this same round.
         if a.merged_into is not None or b.merged_into is not None:
+            continue
+        pair_key = "|".join(sorted([a.id, b.id]))
+        if pair_key in already_rejected:
+            skipped_already_rejected += 1
             continue
         try:
             judgement = _judge_pair(client, storage, a, b)
@@ -464,6 +478,7 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
         elif verdict == "different":
             # §16.8.5: log every reject so threshold/judge tuning has data
             # to chew on. Round summary alone only gives aggregate counts.
+            new_rejections.append(pair_key)
             log_event({
                 "kind": "merge_reject",
                 "pass_id": pass_id,
@@ -473,22 +488,36 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
                 "why": judgement.get("why", ""),
             })
 
-    # Done vote (LLM, one call per round).
+    # Done vote. Short-circuit: if 0 merges happened AND nothing was
+    # skipped via the rejection memory, the candidate pool is identical
+    # to next round's pool, so any further round produces the same 0
+    # merges. No need to spend an LLM call on `_vote_done` — and more
+    # importantly, no need to spend another ~18 min on a duplicate
+    # merge round if `_vote_done` happens to vote "continue".
     round_summary = (
         f"Merge round {iter_idx + 1} over {len(pairs)} candidate pairs: "
         f"merged {verdicts.get('same', 0)}, different {verdicts.get('different', 0)}, "
-        f"caveat {verdicts.get('same_with_caveats', 0)}, errors {verdicts.get('error', 0)}."
+        f"caveat {verdicts.get('same_with_caveats', 0)}, errors {verdicts.get('error', 0)}, "
+        f"skipped_already_rejected {skipped_already_rejected}."
     )
-    try:
-        should_stop = _vote_done(client, round_summary)
-    except Exception:
-        should_stop = True  # fail safe: exit loop on vote failure
+    if verdicts.get("same", 0) == 0:
+        should_stop = True
+    else:
+        try:
+            should_stop = _vote_done(client, round_summary)
+        except Exception:
+            should_stop = True  # fail safe: exit loop on vote failure
     # Hard cap fallback handled in graph routing.
 
     stats = dict(state.get("stats") or {})
     stats["merge_total"] = int(stats.get("merge_total", 0)) + len(merged_ids)
     stats["nodes_pruned_total"] = int(stats.get("nodes_pruned_total", 0)) + ghosts_removed
-    stats[f"merge_round_{iter_idx}"] = {"merged": len(merged_ids), "candidates": len(pairs), **verdicts}
+    stats[f"merge_round_{iter_idx}"] = {
+        "merged": len(merged_ids),
+        "candidates": len(pairs),
+        "skipped_already_rejected": skipped_already_rejected,
+        **verdicts,
+    }
 
     log_event({
         "kind": "merge_round_done",
@@ -500,6 +529,7 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
         "merge_iter": iter_idx + 1,
         "merge_done_vote": should_stop,
         "merged_new_ids": merged_ids,
+        "merge_rejected_pairs": new_rejections,
         "seeded_for_link": merged_ids,
         "stats": stats,
     }

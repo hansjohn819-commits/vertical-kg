@@ -32,6 +32,7 @@ def run_sleep_pass(instance: GraphInstance) -> dict:
             "prune_changed": False,
             "link_changed": False,
             "merged_new_ids": [],
+            "merge_rejected_pairs": [],
             "seeded_for_link": [],
             "link_tried_pairs": [],
             "stats": {},
