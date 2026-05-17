@@ -308,7 +308,7 @@ def test_evidence_builder_renders_chunks_when_present(tmp_path: Path) -> None:
     n.text_unit_ids = [cid]
     gi.storage.add_node(n)
 
-    ctx, ids = _build_chunk_evidence(
+    ctx, ids, chunk_ids = _build_chunk_evidence(
         gi, [n],
         question="How much kelp did ASF process in 2024?",
         include_neighbors=False, use_display_title=True,
@@ -322,6 +322,7 @@ def test_evidence_builder_renders_chunks_when_present(tmp_path: Path) -> None:
     assert "page 5" in ctx
     assert "ASF processed 1.2 million pounds" in ctx
     assert n.id in ids
+    assert cid in chunk_ids
 
 
 def test_evidence_builder_legacy_node_no_chunks(tmp_path: Path) -> None:
@@ -333,7 +334,7 @@ def test_evidence_builder_legacy_node_no_chunks(tmp_path: Path) -> None:
     n = _make_node("LegacyEntity")
     n.summary = "summary only"
     gi.storage.add_node(n)
-    ctx, ids = _build_chunk_evidence(
+    ctx, ids, chunk_ids = _build_chunk_evidence(
         gi, [n],
         question="anything",
         include_neighbors=False, use_display_title=True,
@@ -342,6 +343,7 @@ def test_evidence_builder_legacy_node_no_chunks(tmp_path: Path) -> None:
     assert "summary only" in ctx
     assert "Sources:" not in ctx
     assert n.id in ids
+    assert chunk_ids == []
 
 
 def test_evidence_builder_neighbors_mode(tmp_path: Path) -> None:
@@ -356,7 +358,7 @@ def test_evidence_builder_neighbors_mode(tmp_path: Path) -> None:
     gi.storage.add_node(b)
     gi.storage.add_edge(_make_edge(a.id, b.id))
 
-    ctx, ids = _build_chunk_evidence(
+    ctx, ids, _chunk_ids = _build_chunk_evidence(
         gi, [a],
         question="A and B",
         include_neighbors=True, use_display_title=False,
@@ -377,7 +379,7 @@ def test_evidence_builder_external_omits_neighbors(tmp_path: Path) -> None:
     gi.storage.add_node(b)
     gi.storage.add_edge(_make_edge(a.id, b.id))
 
-    ctx, _ = _build_chunk_evidence(
+    ctx, _, _ = _build_chunk_evidence(
         gi, [a],
         question="anything",
         include_neighbors=False, use_display_title=True,
@@ -391,11 +393,14 @@ def test_evidence_builder_external_omits_neighbors(tmp_path: Path) -> None:
 
 
 def test_show_provenance_edge(tmp_path: Path) -> None:
-    """The §16.8.4 / §16.17 extension: show_provenance now resolves edges
-    too, returning source/target labels, evidence_quote, and any
-    text_unit_ids resolved back to their chunks."""
-    from src.modules.m2_qa_agent import GraphAgent
+    """The §16.8.4 / §16.17 extension: show_provenance resolves edges too,
+    returning source/target labels, evidence_quote, and any text_unit_ids
+    resolved back to their chunks.
 
+    Post-2026-05-15 router refactor: show_provenance is now a Python API
+    on GraphInstance (no longer LLM-callable from chat). Tests against
+    instance.show_provenance() directly.
+    """
     gi = _new_instance(tmp_path)
     cid = uuid4().hex
     gi.text_units.add(_sample_unit(
@@ -413,8 +418,7 @@ def test_show_provenance_edge(tmp_path: Path) -> None:
     e.evidence_quote = "A is the parent of B."
     gi.storage._g.add_edge(a.id, b.id, data=e)
 
-    agent = GraphAgent(gi)
-    res = agent._impl_show_provenance({"node_or_edge_id": e.id})
+    res = gi.show_provenance(e.id)
     assert res["kind"] == "edge"
     assert res["source"]["label"] == "A"
     assert res["target"]["label"] == "B"
@@ -489,13 +493,8 @@ def test_ingest_resilient_to_per_page_llm_exception(
 
 
 def test_show_provenance_not_found(tmp_path: Path) -> None:
-    from src.modules.m2_qa_agent import GraphAgent
-
     gi = _new_instance(tmp_path)
-    agent = GraphAgent(gi)
-    assert agent._impl_show_provenance({"node_or_edge_id": "nope"}) == {
-        "kind": "not_found", "id": "nope",
-    }
+    assert gi.show_provenance("nope") == {"kind": "not_found", "id": "nope"}
 
 
 # ---------------------------------------------------------------------------
@@ -505,9 +504,8 @@ def test_show_provenance_not_found(tmp_path: Path) -> None:
 
 def test_parse_ontology_real_file() -> None:
     """The shipped ontology.md must round-trip cleanly. Test pins the
-    six seed entity types + the relation types currently registered
-    (seed 9 + 6 from round-1 + 2 from round-2 evolution = 17). If
-    either set drifts further from these, this fixture catches it."""
+    six seed entity types + the currently-registered relation types.
+    If either set drifts further from these, this fixture catches it."""
     from src.modules.m1_ingest import parse_ontology
 
     ont = (Path(__file__).resolve().parent.parent / "ontology.md").read_text(encoding="utf-8")
@@ -525,6 +523,11 @@ def test_parse_ontology_real_file() -> None:
         # Round-3 additions (2026-05-11, FAO SOFIA + corpus-wide signals)
         "PRODUCED_BY", "PRODUCED_IN", "AUTHORED_BY", "PUBLISHED",
         "EXPORTS", "INCLUDES", "PART_OF", "FUNDED_BY",
+        # Round-4 additions (2026-05-12, post round-3 corpus signals)
+        "FUNDED", "IMPORTED_FROM", "PARTNERED_WITH", "CONTAINS",
+        "PRODUCES_LOCATION",
+        # Round-5 additions (2026-05-17, post 3 new docs)
+        "HOSTS_OPERATIONS_OF",
     }
     assert rels == expected_rels
     # Spot-check domain extensions across rounds.
@@ -532,17 +535,46 @@ def test_parse_ontology_real_file() -> None:
     assert dom["AFFILIATED_WITH"] == (
         {"Person", "Organization", "Company"}, {"Organization", "Company"},
     )
-    assert dom["STUDIED_LOCATION"] == ({"Person", "Organization"}, {"Location"})
+    # Round-5 extended STUDIED_LOCATION src to include Industry, tgt to include Industry.
+    assert dom["STUDIED_LOCATION"] == (
+        {"Person", "Organization", "Product", "Industry"},
+        {"Location", "Industry"},
+    )
     assert dom["AUDITED_BY"] == ({"Organization", "Company"}, {"Organization", "Company"})
     assert dom["FOUNDED"] == ({"Person"}, {"Company", "Organization"})  # union
     assert dom["PRODUCES"] == ({"Company", "Organization"}, {"Product"})
-    assert dom["AUTHORED_WITH"] == ({"Person"}, {"Person"})
+    # Round-5 extended AUTHORED_WITH to (Person|Organization) × (Person|Organization).
+    assert dom["AUTHORED_WITH"] == (
+        {"Person", "Organization"}, {"Person", "Organization"},
+    )
     assert dom["RELATED_TO"] == (set(), set())  # any × any
     # Round-3 spot checks.
     assert dom["IN_INDUSTRY"] == ({"Company", "Product", "Location"}, {"Industry"})
     assert dom["PRODUCED_BY"] == ({"Product"}, {"Company", "Organization"})
     assert dom["PRODUCED_IN"] == ({"Product"}, {"Location"})
     assert dom["PART_OF"] == (set(), set())  # any × any
+    # Round-5 spot checks: AUTHORED_BY src adds Company; LOCATED_IN src adds Person + Industry.
+    assert dom["AUTHORED_BY"] == (
+        {"Person", "Organization", "Company"}, {"Product"},
+    )
+    assert dom["LOCATED_IN"] == (
+        {"Person", "Organization", "Company", "Location", "Industry"},
+        {"Location"},
+    )
+    assert dom["HOSTS_OPERATIONS_OF"] == (
+        {"Location"}, {"Company", "Organization"},
+    )
+    assert dom["EXPORTS"] == (
+        {"Company", "Organization", "Location"}, {"Product", "Location"},
+    )
+    assert dom["IMPORTED_FROM"] == (
+        {"Company", "Organization", "Location"},
+        {"Company", "Organization", "Location", "Product"},
+    )
+    assert dom["PARTNERED_WITH"] == (
+        {"Person", "Organization", "Company", "Product"},
+        {"Organization", "Company", "Product"},
+    )
 
 
 def test_parse_aliases_real_file() -> None:
@@ -560,6 +592,12 @@ def test_parse_aliases_real_file() -> None:
         # Round-3 addition (2026-05-11): bare AUTHORED collapses into the
         # newly-introduced AUTHORED_BY (person/org → publication).
         "AUTHORED": "AUTHORED_BY",
+        # Round-4 additions (2026-05-12): surface variants of two newly-
+        # promoted relations.
+        "IMPORT_FROM": "IMPORTED_FROM",
+        "PARTNERS_WITH": "PARTNERED_WITH",
+        # Round-5 addition (2026-05-17): typo from the OHS document.
+        "OPERATESS_IN": "OPERATES_IN",
     }
 
 

@@ -70,23 +70,62 @@ def encode_query(text: str) -> np.ndarray:
     return v.astype(np.float32)
 
 
+RRF_K = 60          # Reciprocal Rank Fusion constant (Cormack 2009 default)
+HYBRID_DENSE_K = 20  # how many dense hits to fetch before fusion
+HYBRID_BM25_K = 20   # how many BM25 hits to fetch before fusion
+
+
 def top_k(
     vector_store: VectorStore,
     storage: GraphStorage,
     question: str,
     k: int = 5,
+    bm25_store=None,
 ) -> list[Node]:
-    """FAISS top-k by cosine. Filters out ghosts and missing-from-storage hits."""
-    if vector_store.size == 0:
+    """Top-k node retrieval. Two modes:
+
+    1. **Dense only** (`bm25_store=None`): FAISS cosine top-k. Used by the
+       internal pipeline which does its own lexical disambiguation via
+       label-substring matching (`_label_match_seeds` in m2_qa_v2).
+    2. **Hybrid dense+BM25** (`bm25_store` provided): fetch HYBRID_DENSE_K
+       dense hits and HYBRID_BM25_K BM25 hits, fuse via RRF (k=60), return
+       top-k unique nodes. Used by the external fast-query path; BM25
+       catches lexically distinctive labels (`Last, First` bibliography
+       style, rare proper nouns) that dense embedding misses.
+
+    Filters out ghosts and missing-from-storage hits in both modes.
+    """
+    if vector_store.size == 0 and (bm25_store is None or bm25_store.size == 0):
         return []
+
     qv = encode_query(question)
-    hits = vector_store.query(qv, k)
+    dense_hits = vector_store.query(qv, HYBRID_DENSE_K if bm25_store else k)
+
+    if bm25_store is None:
+        nodes: list[Node] = []
+        for nid, _score in dense_hits[:k]:
+            n = storage.get_node(nid)
+            if n is None or n.merged_into is not None:
+                continue
+            nodes.append(n)
+        return nodes
+
+    # Hybrid: RRF fuse dense + bm25
+    bm25_hits = bm25_store.query(question, HYBRID_BM25_K)
+    scores: dict[str, float] = {}
+    for rank, (nid, _) in enumerate(dense_hits):
+        scores[nid] = scores.get(nid, 0.0) + 1.0 / (RRF_K + rank + 1)
+    for rank, (nid, _) in enumerate(bm25_hits):
+        scores[nid] = scores.get(nid, 0.0) + 1.0 / (RRF_K + rank + 1)
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
     nodes: list[Node] = []
-    for nid, _score in hits:
+    for nid, _ in ranked:
         n = storage.get_node(nid)
         if n is None or n.merged_into is not None:
             continue
         nodes.append(n)
+        if len(nodes) >= k:
+            break
     return nodes
 
 

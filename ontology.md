@@ -83,8 +83,8 @@
   inverse: OWNED_BY
 
 ## AUTHORED_WITH
-  domain: Person × Person
-  semantics: two persons co-authored a publication together. Symmetric — direction has no semantic meaning, the inverse is the same predicate.
+  domain: (Person | Organization) × (Person | Organization)
+  semantics: two parties co-authored a publication together. Symmetric — direction has no semantic meaning, the inverse is the same predicate. Person × Person covers academic co-authorship; Organization × Organization covers joint institutional reports ("FAO, IFAD and UNICEF co-authored the State of Food Security report"); mixed Person × Organization is also accepted when an individual co-signs with a body.
   inverse: AUTHORED_WITH
 
 ## AFFILIATED_WITH
@@ -98,19 +98,24 @@
   inverse: PUBLISHED
 
 ## STUDIED_LOCATION
-  domain: (Person | Organization) × Location
-  semantics: entity performed research, fieldwork, or analysis focused on this location. Use only when the source explicitly ties the entity to studying that place — not for incidental mentions. Organizations include research institutes, government agencies running studies, NGOs publishing assessments.
+  domain: (Person | Organization | Product | Industry) × (Location | Industry)
+  semantics: entity performed research, fieldwork, or analysis focused on this region or industry sector. Use only when the source explicitly ties the entity to studying the target — not for incidental mentions. Organizations include research institutes, government agencies running studies, NGOs publishing assessments. Products are included for reports, studies, and datasets whose subject scope is a named location or industry ("State of the Kelp Industry studies the Gulf of Maine", "SOFIA 2024 studies fisheries"). Industry as src covers sector-level research bodies ("seaweed production research focused on North-West Europe").
   inverse: STUDIED_BY
 
 ## LOCATED_IN
-  domain: (Organization | Company | Location) × Location
-  semantics: physical or jurisdictional containment — entity exists within or is part of the target location. Distinct from HEADQUARTERED_IN which is specifically about an HQ.
+  domain: (Person | Organization | Company | Location | Industry) × Location
+  semantics: physical or jurisdictional containment — entity exists within or is part of the target location. Distinct from HEADQUARTERED_IN which is specifically about an HQ. Person covers residence / current base ("Kelly Hinkle is located in Maine"); Industry covers regional industry sectors ("Maine seaweed sector LOCATED_IN Maine").
   inverse: CONTAINS
 
 ## OPERATES_IN
   domain: (Company | Organization) × Location
   semantics: entity has business or operational activity in the location, even when not headquartered there. Multi-region companies / NGOs typically have many of these.
   inverse: HOSTS_OPERATIONS_OF
+
+## HOSTS_OPERATIONS_OF
+  domain: Location × (Company | Organization)
+  semantics: inverse of OPERATES_IN — the location hosts the operations of the source entity. The M1 LLM emits this direction on location-first sentences ("New Brunswick hosts Cooke Aquaculture's operations"). Same semantic content as OPERATES_IN, just the other arrow.
+  inverse: OPERATES_IN
 
 ## AUDITED_BY
   domain: (Organization | Company) × (Organization | Company)
@@ -133,8 +138,8 @@
   inverse: PRODUCES_LOCATION
 
 ## AUTHORED_BY
-  domain: (Person | Organization) × Product
-  semantics: the person or organization authored the product (paper, report, book, standard, dataset). Use for the author→work direction when there is a single author or when listing authors; use AUTHORED_WITH for co-authorship between two people. Organizations are included for corporate authorship (e.g., "FAO authored SOFIA 2024").
+  domain: (Person | Organization | Company) × Product
+  semantics: the person, organization, or company authored the product (paper, report, book, standard, dataset). Use for the author→work direction when there is a single author or when listing authors; use AUTHORED_WITH for co-authorship between two parties. Organizations are included for corporate authorship (e.g., "FAO authored SOFIA 2024"); Companies are included for consulting firms / industry analysts ("Maritime Blue & Ocean Strategies authored the Washington Seaweed Aquaculture Economic Potential Analysis").
   inverse: AUTHORED
 
 ## PUBLISHED
@@ -143,8 +148,8 @@
   inverse: PUBLISHED_BY
 
 ## EXPORTS
-  domain: (Company | Organization | Location) × Product
-  semantics: source entity exports the product to other regions. Locations cover country/region-level export statistics common in industry reports ("China exports sea kelp"). Companies and organizations cover firm-level exports.
+  domain: (Company | Organization | Location) × (Product | Location)
+  semantics: source entity exports goods to the target. Product target covers the commodity-level pattern ("China exports sea kelp"); Location target covers destination-pair trade statistics common in trade reports ("Ecuador exports to the United States"). Companies and organizations cover firm-level exports.
   inverse: IMPORTED_FROM
 
 ## INCLUDES
@@ -162,6 +167,31 @@
   semantics: source entity received funding, grants, or financial support from the target. Products are included because grants are often described as funding a specific project, paper, or program ("research funded by NSF"). Common in NGO annual reports and academic acknowledgments.
   inverse: FUNDED
 
+## FUNDED
+  domain: (Organization | Company) × (Person | Organization | Company | Product | Industry)
+  semantics: inverse of FUNDED_BY — source entity provides funding, grants, or financial support to the target. Same semantic content as FUNDED_BY, just the other direction; the M1 LLM emits this direction on funder-first sentences ("Green Climate Fund funded the EAF-Nansen Programme").
+  inverse: FUNDED_BY
+
+## IMPORTED_FROM
+  domain: (Company | Organization | Location) × (Company | Organization | Location | Product)
+  semantics: source entity imports goods or products from the target. Locations cover country/region-level import statistics common in trade reports ("the European Union imported from Norway"); Product target covers commodity-level pattern ("Africa imports mackerels"), symmetric with EXPORTS having Product in its target. Inverse of EXPORTS at the relation level; both directions are emitted by the M1 LLM depending on sentence form.
+  inverse: EXPORTS
+
+## PARTNERED_WITH
+  domain: (Person | Organization | Company | Product) × (Organization | Company | Product)
+  semantics: source entity has a named partnership, collaboration agreement, or co-implementation arrangement with the target. Distinct from AFFILIATED_WITH (institutional affiliation / membership) and CONTRACTED_WITH (formal contractual procurement). Products are valid on either side for programs / initiatives described as "partnered with" ("FISH4ACP partnered with Chinhoyi University of Technology", "International Maritime Organization partnered with GloLitter Partnerships Project"). Symmetric in intent — direction reflects the sentence form, not a semantic asymmetry.
+  inverse: PARTNERED_WITH
+
+## CONTAINS
+  domain: (Location | Organization | Product | Industry) × (Location | Organization | Product | Industry | Company)
+  semantics: source entity structurally contains the target. Polymorphic: covers geographic containment (Location × Location), organizational sub-units (Organization × Organization), report sections / annexes (Product × Product), and industry coverage of constituent entities. Prefer a more specific relation when one exists (LOCATED_IN's inverse for geographic, AFFILIATED_WITH for institutional membership, INCLUDES for industry sector, PART_OF's inverse for generic containment).
+  inverse: LOCATED_IN
+
+## PRODUCES_LOCATION
+  domain: Location × Product
+  semantics: inverse of PRODUCED_IN — location produces, harvests, cultivates, or otherwise originates the product. Same semantic content as PRODUCED_IN, just the other direction; the M1 LLM emits this direction on location-first sentences ("Maine produces kelp", "China exports sea kelp").
+  inverse: PRODUCED_IN
+
 ## RELATED_TO
   domain: any × any
   semantics: generic fallback edge for M4d link-form until a specific type is proposed
@@ -176,6 +206,9 @@
 - AFFULIATED_WITH → AFFILIATED_WITH
 - AFFILIATIED_WITH → AFFILIATED_WITH
 - AUTHORED → AUTHORED_BY
+- IMPORT_FROM → IMPORTED_FROM
+- PARTNERS_WITH → PARTNERED_WITH
+- OPERATESS_IN → OPERATES_IN
 
 # Global Conventions
 - summary length: ≤300 tokens
@@ -215,3 +248,27 @@
   - **Added alias** `AUTHORED → AUTHORED_BY`. 6 proposals of bare `AUTHORED` — same semantic as the just-added AUTHORED_BY, treat as a surface variant.
   - Deferred for further evidence: `PART_OF_CLUSTER` (12 cross-document but still PESTLE-specific), `USED_IN_PRODUCTION_OF` / `CONTRIBUTED_DATA_TO` / `PUBLISHED_IN` (5-6 each, FAO SOFIA-specific patterns — wait for non-FAO confirmation), `MEMBERSHIP_OF` / `CUSTODIAN_OF` / `PART_OF_SERIES` / `PARTNERS_WITH` (3-4 each, still below threshold), entity types `Concept` (50) and `Entity` (17) (both too generic — wait for a concrete structural need).
   - Audit note: 83 `AFFILIATED_WITH Organization→Organization` and 23 `CEO_OF Person→Organization` mismatches remain in this log window, but both domains were already extended in round 2; these signals span the round-1/round-2 boundary and should disappear after `scripts/normalize_edges.py` is re-run against the current ontology.
+- 2026-05-11 (later same day): fourth round, triggered by ingest of five additional documents post round 3 (Maine-Seaweed-Benchmarking, Washington-Seaweed-Aquaculture-Economic-Potential, State-of-the-Kelp-Industry-Report_Feb-2026 [80p + tail], TEA, doc.pdf) plus a retroactive `normalize_edges` and an M4d link_form pass. Aggregated 239 relation_type_proposed across 121 distinct types and 915 domain_mismatch events. Five new relations + two aliases added; STUDIED_LOCATION src extended.
+  - **Added `FUNDED`** ((Organization | Company) × (Person | Organization | Company | Product | Industry)). 9 proposals across 3 documents. Inverse of FUNDED_BY (added round 3); inverse name was already declared but never registered as its own type. Same pattern as PUBLISHED / PUBLISHED_BY and PRODUCES / PRODUCED_BY.
+  - **Added `IMPORTED_FROM`** ((Company | Organization | Location) × (Company | Organization | Location)). 5 direct proposals + 5 `IMPORT_FROM` typo variants. Inverse of EXPORTS was declared but unregistered. Country-level import statistics are a standard pattern in trade reports.
+  - **Added `PARTNERED_WITH`** ((Person | Organization | Company | Product) × (Organization | Company)). 6 `PARTNERED_WITH` + 1 `PARTNERS_WITH` across 3 documents. Deferred twice in rounds 1 and 2 ("≤2 proposals each — wait for cross-document confirmation"); now well past threshold. Distinct from AFFILIATED_WITH (membership/affiliation) and CONTRACTED_WITH (procurement contract).
+  - **Added `CONTAINS`** ((Location | Organization | Product | Industry) × (Location | Organization | Product | Industry | Company)). 10 proposals across 3 documents. Was declared as `LOCATED_IN.inverse: CONTAINS` (round 1) but unregistered; also picks up structural containment beyond geography (report sections, organizational sub-units).
+  - **Added `PRODUCES_LOCATION`** (Location × Product). 3 direct proposals + 92 `PRODUCED_IN Location→Product` domain_mismatch events. Inverse of PRODUCED_IN (added round 3); inverse name was already declared. The M1 model emits this direction on location-first sentences, identical pattern to PUBLISHED / PUBLISHED_BY.
+  - **Extended `STUDIED_LOCATION` src** from `(Person | Organization)` to `(Person | Organization | Product)`. Trigger: 91 `Product → Location` domain_mismatch events (reports / studies whose subject scope is a named region, e.g., "State of the Kelp Industry → Gulf of Maine"). Distinct from PRODUCED_IN — the product is the research instrument, not the harvested good.
+  - **Added aliases** `IMPORT_FROM → IMPORTED_FROM` (5 occurrences, surface variant of newly registered IMPORTED_FROM) and `PARTNERS_WITH → PARTNERED_WITH` (1 occurrence; will catch the recurring tense variant before it fragments the vocabulary).
+  - Deferred for further evidence: `USED_IN_PRODUCTION_OF` / `CONTRIBUTED_DATA_TO` (5 each, FAO SOFIA single-document — deferred third round, still no non-FAO confirmation), `CONTRACTED_WITH` (5, single-document Washington TEA), `COMPARED_TO` (8, dominantly `Concept→Concept` — gated on Concept entity decision), `PART_OF_CLUSTER` (6, PESTLE-specific, deferred third consecutive round), `CONTAINS` polymorphism into Industry domain (kept narrow to evidence-supported types this round), `entity_type_proposed: Concept` (9 this round, cumulative ~59 — exceeds threshold but introducing the type would broadly disrupt existing domains; needs a coordinated Concept + Concept-domain relations promotion, scheduled for round 5).
+  - Audit note: the large mismatch pile on `OPERATES_IN Product→Location` (62) / `LOCATED_IN Product→Location` (41) / `AFFILIATED_WITH Organization→Location` (49) / `IN_INDUSTRY Industry→Location` (32) is `normalize_edges.py` residue, not an ontology gap — round 3 already added PRODUCED_IN / INCLUDES / extended IN_INDUSTRY src to cover these. Will dissolve after the next normalize_edges run against the current ontology.
+- 2026-05-17: fifth round, triggered by ingest of three new documents post round 4 (occupational_health_and_safety_in_aquaculture, Facilitating-development-of-the-seaweed-cultivation-sector-in-Scotland-Feb-2022, Global-status-of-seaweed-production-trade-and-utilization-Junning-Cai-FAO). Aggregated proposals across the three runs: 0 new entity types (the existing six cover the new content), 23 relation_type_proposed across 11 distinct types (mostly single-document, deferred), and 343 domain_mismatch events concentrated on a handful of patterns. Eight domain extensions + one new relation + one alias added.
+  - **Extended `AUTHORED_BY` src** from `(Person | Organization)` to `(Person | Organization | Company)`. Trigger: 21 `Company → Product` mismatches across 3 documents — consulting firms / industry analysts authoring corporate reports ("Maritime Blue & Ocean Strategies, Inc. → Washington Seaweed Aquaculture Economic Potential Analysis"). Standard pattern in grey literature that the original Person/Org-only domain was rejecting.
+  - **Extended `IMPORTED_FROM` tgt** to include `Product`. Trigger: 14 `Location → Product` mismatches across 3 documents — commodity-level import flows ("Africa imports mackerels"). Symmetric with EXPORTS already having Product in its target.
+  - **Extended `LOCATED_IN` src** from `(Organization | Company | Location)` to `(Person | Organization | Company | Location | Industry)`. Trigger: 12 `Industry → Location` mismatches across 3 documents ("Maine seaweed sector LOCATED_IN Maine") + 9 `Person → Location` mismatches across 3 documents ("Kelly Hinkle LOCATED_IN Maine"). Two extensions in one bullet.
+  - **Extended `STUDIED_LOCATION`** — src adds `Industry`, tgt adds `Industry`. Trigger: 9 `Industry → Location` mismatches across 3 documents ("seaweed production studied in North West Europe") + 8 `Product → Industry` mismatches across 3 documents ("SOFIA 2024 studies fisheries"). Industry as both ends of a "studied" relation is natural for sector-level research bodies and for cross-sector studies.
+  - **Extended `AUTHORED_WITH` domain** from `Person × Person` to `(Person | Organization) × (Person | Organization)`. Trigger: 6 `Organization → Organization` mismatches across 2 documents ("FAO authored_with IFAD / UNICEF"). Joint institutional reports are common in the FAO corpus.
+  - **Added `HOSTS_OPERATIONS_OF`** (Location × (Company | Organization)). Trigger: 7 `OPERATES_IN: Location → Company` mismatches across 3 documents ("New Brunswick → Cooke Aquaculture"). Was declared as `OPERATES_IN.inverse: HOSTS_OPERATIONS_OF` (round 1) but unregistered. Same pattern as PUBLISHED / PUBLISHED_BY and PRODUCES_LOCATION / PRODUCED_IN — the M1 model emits this direction on location-first sentences.
+  - **Extended `EXPORTS` tgt** from `Product` to `(Product | Location)`. Trigger: 4 `Location → Location` mismatches across 3 documents ("Ecuador → United States") + 4 `Company → Location` mismatches in Scotland ("SFO → Europe / Far East"). Destination-pair trade statistics are a standard pattern in trade reports.
+  - **Extended `PARTNERED_WITH` tgt** from `(Organization | Company)` to `(Organization | Company | Product)`. Trigger: 11 `Organization → Product` mismatches across 3 documents ("International Maritime Organization → GloLitter Partnerships Project"). Programs / initiatives are valid partnership targets, symmetric with the src side which already allowed Product.
+  - **Added alias** `OPERATESS_IN → OPERATES_IN` (1 typo from the OHS doc; cheap to register before it fragments).
+  - Deferred for further evidence: `SUPPLIES` (Org → Co, 8 in Scotland — single-document, wait for cross-doc), `ASSISTED_WITH` (4, Scotland), `OWNED_BY` (3, Scotland — distinct from existing OWNS inverse name; defer), `CONTRACTED_WITH` (1, Scotland — third consecutive defer), `LEAD_PROJECT` / `SIBLING_OF` / `ADMINISTRATES` / `ADMINISTER_RULES_OF` / lowercase `part_of` / meta `ALIAS` (all 1-event noise).
+  - Not adopted as ontology changes (semantic / typing errors, not gaps): `PRODUCED_IN: Location → Product` (43, already covered by PRODUCES_LOCATION — normalize_edges residue from round 4); `LOCATED_IN: Product → Location` (17, Walton's Mill Dam mistyped as Product); `PARTNERED_WITH: Organization → Location` (17, semantically OPERATES_IN); `AFFILIATED_WITH: Organization → Location` (9, semantically OPERATES_IN); `STUDIED_LOCATION: Location → Product` (5, direction error); `LOCATED_IN: Organization → Organization` (5, semantically AFFILIATED_WITH); `IN_INDUSTRY: Industry → Location` (4, direction error); `FUNDED_BY: Organization → Product` (3, direction error — use FUNDED); `INCLUDES: Product → Industry` (5, type-coercion error on LFCS).
+  - Single-document type-coercion noise (Global-FAO labels "Seaweeds" as Industry instead of Product, producing 19 `EXPORTS: Location → Industry` and 18 `PRODUCES_LOCATION: Location → Industry` mismatches): these will dissolve when downstream M4b merges fold "Seaweeds (Industry)" into the existing "Seaweed" / "Seaweeds (Product)" node, or via a manual reclassify pass.
+  - Audit note: the round-5 changes should flush most of this run's RELATED_TO residue. Run `scripts/normalize_edges.py` + `scripts/dedupe_edges.py` immediately after this commit to retroactively rewrite the edges that the three new runs downgraded under the previous ontology.

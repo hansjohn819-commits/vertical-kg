@@ -312,6 +312,7 @@ def _execute_merge(
         summary=fused_summary,
         detail=fused_detail,
         weight=a.weight + b.weight,
+        version=max(a.version, b.version) + 1,
         provenance=DerivedProv(
             operation_id=f"{pass_id}:merge:{primary.label}+{secondary.label}",
             operation_type="merge",
@@ -364,6 +365,16 @@ def _execute_merge(
     # Mark originals for one-pass-delayed cleanup (§5.5).
     a.merged_into = new_node.id
     b.merged_into = new_node.id
+
+    # Flatten ghost chains: any prior ghost that pointed at a or b now
+    # points at new_node. Keeps depth-of-chain at 1 so show_provenance
+    # and any merged_into walker doesn't have to recurse mid-pass.
+    # (Without this, A→B→C chains form when a previous-iter ghost's target
+    # gets merged again in a later iter of the same pass.)
+    for n in storage.nodes():
+        if n.merged_into in (a.id, b.id):
+            n.merged_into = new_node.id
+
     return new_node
 
 
