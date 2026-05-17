@@ -113,3 +113,11 @@ class Edge(BaseModel):
     # chunk that supports this relationship. PASS 2 sanity-checks LLM output by
     # fuzzy-matching this against the chunk text. PASS 1 may leave it empty.
     evidence_quote: str = ""
+
+    # §16.19 ontology-compliance audit. Populated when an LLM-proposed type
+    # is rejected — either as an unregistered type, or registered but used
+    # outside its declared domain — and the edge is forced to RELATED_TO.
+    # Stores the alias-resolved canonical form (typo info lives in the
+    # alias_resolved log event). The 4e sub-op uses this field to rescue
+    # edges later when the ontology evolves to include the proposed type.
+    original_type: str | None = None

@@ -810,20 +810,31 @@ def _reclassify_related_to_edges(
     *,
     raw_doc_id: str, run_id: str,
     alias_map: dict[str, str] | None = None,
+    edge_ids: set[str] | None = None,
 ) -> dict:
-    """Re-categorize every edge currently typed RELATED_TO.
+    """Re-categorize RELATED_TO edges through the LLM.
 
-    Sends edges to the LLM in batches of `_RECLASSIFY_BATCH`. For each
-    edge the model returns a decision: an ontology type, a proposed
-    new type, or the literal "RELATED_TO" (keep as-is). Decisions are
-    validated against the domain map before being applied — a model
-    that picks an ontology type whose domain doesn't fit gets caught
-    here and the edge stays RELATED_TO (with an `ontology_proposal:
-    domain_mismatch` event logged for audit).
+    Scope (§16.19 a): when ``edge_ids`` is provided, restrict the
+    candidate pool to those edges only. The M1 pipeline passes the set
+    of edges created during *this* run, so the post-pass classifier no
+    longer sweeps the whole graph — historical RELATED_TO sediment is
+    the sleep-pass 4e sub-op's problem (or the scripts/reclassify_edges
+    CLI for one-off backfills). ``edge_ids=None`` keeps the legacy
+    full-graph behavior, which is what the CLI path uses.
+
+    For each candidate the model returns a decision: an ontology type,
+    a proposed new type, or the literal "RELATED_TO" (keep as-is).
+    Decisions are validated against the domain map before being
+    applied — a model that picks an ontology type whose domain doesn't
+    fit gets caught here and the edge stays RELATED_TO (with an
+    ``ontology_proposal: domain_mismatch`` event logged for audit).
 
     Returns a stats dict the caller can fold into the ingest summary.
     """
-    candidates = [e for e in storage.edges() if e.type == "RELATED_TO"]
+    candidates = [
+        e for e in storage.edges()
+        if e.type == "RELATED_TO" and (edge_ids is None or e.id in edge_ids)
+    ]
     stats = {"reclassified": 0, "kept_related_to": 0, "proposed_new": 0,
              "rejected_domain": 0, "batches": 0, "errors": 0}
     if not candidates:
@@ -890,10 +901,14 @@ def _reclassify_related_to_edges(
                 pass_label="reclassify",
                 alias_map=alias_map,
             )
+            canonical_proposed = (alias_map or {}).get(new_type, new_type)
             if final_type == "RELATED_TO":
                 # Validator downgraded — keep edge as RELATED_TO. Counts
                 # as a domain rejection because the model picked a real
-                # type that didn't fit.
+                # type that didn't fit. §16.19 b: stash the canonical
+                # proposal so 4e can rescue once ontology catches up.
+                if canonical_proposed != "RELATED_TO":
+                    e.original_type = canonical_proposed
                 stats["rejected_domain"] += 1
                 continue
             e.type = final_type
@@ -1200,6 +1215,15 @@ def ingest_document(
                 pass_label="pass1",
                 alias_map=ontology_aliases,
             )
+            # §16.19 b: record the canonical proposed type when the
+            # validator downgraded a real proposal to RELATED_TO. Sleep
+            # pass 4e uses this to rescue the edge after ontology evolves.
+            canonical_proposed = (ontology_aliases or {}).get(proposed_type, proposed_type)
+            original_type = (
+                canonical_proposed
+                if final_type == "RELATED_TO" and canonical_proposed != "RELATED_TO"
+                else None
+            )
             edge = Edge(
                 source_id=src.id,
                 target_id=tgt.id,
@@ -1210,6 +1234,7 @@ def ingest_document(
                 ),
                 text_unit_ids=[chunk_id],
                 evidence_quote=evidence_quote,
+                original_type=original_type,
             )
             storage.add_edge(edge)
             edges_added += 1
@@ -1343,6 +1368,14 @@ def ingest_document(
                     pass_label="pass2",
                     alias_map=ontology_aliases,
                 )
+                # §16.19 b: mirror PASS 1 — capture canonical proposed
+                # type when the validator downgrades to RELATED_TO.
+                canonical_proposed = (ontology_aliases or {}).get(proposed_type, proposed_type)
+                original_type = (
+                    canonical_proposed
+                    if final_type == "RELATED_TO" and canonical_proposed != "RELATED_TO"
+                    else None
+                )
                 edge = Edge(
                     source_id=src.id,
                     target_id=tgt.id,
@@ -1353,6 +1386,7 @@ def ingest_document(
                     ),
                     text_unit_ids=[chunk_id],
                     evidence_quote=quote,
+                    original_type=original_type,
                 )
                 storage.add_edge(edge)
                 pass2_added += 1
@@ -1373,13 +1407,20 @@ def ingest_document(
             _save_all()
 
     # =====================================================================
-    # Post-pass classifier — re-categorize RELATED_TO edges (§16.17.3D)
+    # Post-pass classifier — re-categorize RELATED_TO edges (§16.17.3D).
+    # §16.19 a: scope to this-run edges only. Historical RELATED_TO is
+    # the sleep-pass 4e sub-op's domain (or scripts/reclassify_edges).
     # =====================================================================
+    this_run_edge_ids = {
+        e.id for e in storage.edges()
+        if getattr(e.provenance, "extraction_run_id", None) == run_id
+    }
     reclassify_stats = _reclassify_related_to_edges(
         client, storage, relation_types_block,
         ontology_relation_types, ontology_domain_map, log_event,
         raw_doc_id=raw_doc_id, run_id=run_id,
         alias_map=ontology_aliases,
+        edge_ids=this_run_edge_ids,
     )
     _save_all()
 
