@@ -94,7 +94,9 @@ def _active_nodes(storage: GraphStorage) -> list[Node]:
     return [n for n in storage.nodes() if n.merged_into is None]
 
 
-def _cleanup_prior_ghosts(storage: GraphStorage, vector_store: VectorStore) -> int:
+def _cleanup_prior_ghosts(
+    storage: GraphStorage, vector_store: VectorStore, *, pass_id: str,
+) -> int:
     """Delete nodes carrying merged_into from a prior pass (§5.5 one-pass delay).
 
     Vector-store removal is idempotent — the merge that produced the ghost
@@ -106,6 +108,18 @@ def _cleanup_prior_ghosts(storage: GraphStorage, vector_store: VectorStore) -> i
         # Only drop ghosts with no incident edges (edges should have been
         # migrated during the merge that created them).
         if not storage.incident_edges(g.id):
+            # §16.8.1: capture identity before the node disappears so the
+            # log is a self-contained tombstone (label/type/summary_head).
+            log_event({
+                "kind": "prune_node",
+                "pass_id": pass_id,
+                "summary": f"removed ghost {g.label}",
+                "node_id": g.id,
+                "label": g.label,
+                "type": g.type,
+                "summary_head": (g.summary or "")[:100],
+                "merged_into": g.merged_into,
+            })
             vector_store.remove(g.id)  # idempotent
             storage.remove_node(g.id)
             removed += 1
@@ -398,7 +412,7 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
     iter_idx = int(state.get("merge_iter", 0))
 
     if iter_idx == 0:
-        ghosts_removed = _cleanup_prior_ghosts(storage, vector_store)
+        ghosts_removed = _cleanup_prior_ghosts(storage, vector_store, pass_id=pass_id)
     else:
         ghosts_removed = 0
 
@@ -447,6 +461,17 @@ def merge_step(state: PassState, *, instance: GraphInstance) -> dict:
             a.weight *= 0.9
             b.weight *= 0.9
             log_event({"kind": "merge_caveat", "pass_id": pass_id, "summary": f"{a.label} ~ {b.label}", "why": judgement.get("why", "")})
+        elif verdict == "different":
+            # §16.8.5: log every reject so threshold/judge tuning has data
+            # to chew on. Round summary alone only gives aggregate counts.
+            log_event({
+                "kind": "merge_reject",
+                "pass_id": pass_id,
+                "summary": f"{a.label} ≠ {b.label}",
+                "a_id": a.id, "a_label": a.label, "a_type": a.type,
+                "b_id": b.id, "b_label": b.label, "b_type": b.type,
+                "why": judgement.get("why", ""),
+            })
 
     # Done vote (LLM, one call per round).
     round_summary = (
