@@ -15,6 +15,7 @@ tab function owns its own sidebar content during render.
 
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -363,25 +364,75 @@ def _render_frozen_timer(elapsed: float) -> None:
     )
 
 
-def _handle_file_upload(
+_INGEST_CMD_RE = re.compile(r"^\s*/ingest(?:\s+(.+))?\s*$", re.IGNORECASE)
+
+
+_FILE_ICON_BY_EXT = {
+    ".pdf": "📕",
+    ".txt": "📄",
+    ".md": "📝",
+    ".markdown": "📝",
+}
+
+
+def _render_attachment_card(attachment: dict) -> None:
+    """Render a ChatGPT-style file card inside the user's chat bubble.
+
+    ``attachment`` is a small metadata dict — ``{"name", "size_kb",
+    "ext"}`` — persisted in the message so the card survives reruns + chat
+    reload. Bytes are NOT stored (they live only in session_state until
+    committed and would bloat the chats DB)."""
+    name = attachment.get("name", "(unknown)")
+    size_kb = attachment.get("size_kb", 0)
+    ext = attachment.get("ext", "").lower()
+    icon = _FILE_ICON_BY_EXT.get(ext, "📎")
+    label = ext.lstrip(".").upper() or "FILE"
+    st.markdown(
+        f'<div style="display: inline-flex; align-items: center; gap: 12px; '
+        f'padding: 10px 14px; background: #2b2f36; color: #f0f0f0; '
+        f'border-radius: 10px; border: 1px solid #3a3f47; '
+        f'margin-bottom: 8px; max-width: 360px;">'
+        f'<div style="font-size: 28px; line-height: 1;">{icon}</div>'
+        f'<div style="display: flex; flex-direction: column; '
+        f'min-width: 0; overflow: hidden;">'
+        f'<div style="font-weight: 600; overflow: hidden; '
+        f'text-overflow: ellipsis; white-space: nowrap;">{name}</div>'
+        f'<div style="font-size: 12px; color: #a0a8b0;">'
+        f'{label} · {size_kb} KB</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _commit_staged_upload(
     gi: GraphInstance,
-    uploaded_file,
-    user_text: str,
+    staged: dict,
+    target_basename: str | None,
 ) -> str:
-    """Save the uploaded file to data/raw/ and run ingest (§16.13)."""
+    """Write the in-memory staged file to data/raw/ then run /ingest.
+
+    Implements the §16.13 staged-upload flow: drag drops the bytes into
+    session state only; ``/ingest`` (any submission, with or without an
+    argument) is what commits them to disk and triggers the ingest. The
+    bytes always land at data/raw/<staged.name>; ``target_basename`` lets
+    the user type ``/ingest <other>`` to ingest a different already-on-disk
+    file while still persisting the attachment for later.
+    """
     import unicodedata
 
     if gi.sleep_pass_running:
         return "Working-memory maintenance is running. Cannot ingest right now."
 
-    basename = unicodedata.normalize("NFKC", uploaded_file.name)
+    staged_name = unicodedata.normalize("NFKC", staged["name"])
     raw_dir = Path("data") / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    dest = raw_dir / basename
-    dest.write_bytes(uploaded_file.read())
+    dest = raw_dir / staged_name
+    dest.write_bytes(staged["bytes"])
 
+    target = target_basename or staged_name
     agent = GraphAgent(gi)
-    result = agent._impl_ingest_file({"filename": basename})
+    result = agent._ingest_file(target)
 
     if result.get("error"):
         return f"Upload failed: {result['error']}"
@@ -398,7 +449,7 @@ def _handle_file_upload(
     duplicates = result.get("duplicate_edges_removed", 0)
     superchunks = result.get("split_into_superchunks", 0)
     final_edges = pass1_edges + pass2_edges - duplicates
-    parts = [f"Ingested **{basename}**"]
+    parts = [f"Ingested **{target}**"]
     if pages > 1:
         page_label = f"({pages} pages"
         if superchunks > 1:
@@ -433,7 +484,33 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
             with st.chat_message(m["role"]):
                 if m["role"] == "assistant" and "elapsed" in m:
                     _render_frozen_timer(float(m["elapsed"]))
+                if m["role"] == "user" and m.get("attachment"):
+                    _render_attachment_card(m["attachment"])
                 st.markdown(m.get("content") or "")
+
+    # Persistent staged-file indicator (§16.13 follow-up). Streamlit's
+    # chat_input clears its native file chip after submit, so once we move
+    # the bytes into session state the user otherwise has no visible cue
+    # that the upload is still pending. Render a chip above the input
+    # with a × button so they can dismiss it without sending /ingest.
+    if role == ROLE_INTERNAL and st.session_state.get("staged_upload"):
+        staged = st.session_state["staged_upload"]
+        size_kb = max(1, len(staged["bytes"]) // 1024)
+        c1, c2 = st.columns([20, 1])
+        with c1:
+            st.markdown(
+                f'<div style="padding: 8px 12px; background: #f0f4f8; '
+                f'border-radius: 6px; border-left: 3px solid #4a90e2; '
+                f'color: #333; margin-bottom: 6px;">'
+                f'📎 <b>{staged["name"]}</b> ({size_kb} KB) staged — '
+                f'type <code>/ingest</code> to save &amp; process.</div>',
+                unsafe_allow_html=True,
+            )
+        with c2:
+            if st.button("✕", key="clear_staged_upload",
+                         help="Discard staged file"):
+                st.session_state["staged_upload"] = None
+                st.rerun()
 
     chat_kwargs: dict = {"placeholder": _placeholder_for(role)}
     if role == ROLE_INTERNAL:
@@ -452,19 +529,66 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
     else:
         user_text = str(user_input)
 
+    # §16.13 staged-upload flow: dragging a file stashes its bytes in
+    # session state; ``/ingest`` (this submission or a later one) commits
+    # them to data/raw/ and triggers the ingest pipeline.
     if uploaded_file and role == ROLE_INTERNAL:
-        reply = _handle_file_upload(gi, uploaded_file, user_text)
-        display_text = user_text or f"[uploaded {uploaded_file.name}]"
-        st.session_state["messages"].append({"role": "user", "content": display_text})
+        st.session_state["staged_upload"] = {
+            "name": uploaded_file.name,
+            "bytes": uploaded_file.read(),
+        }
+
+    ingest_match = _INGEST_CMD_RE.match(user_text)
+    has_stage = bool(st.session_state.get("staged_upload"))
+
+    # Path A — commit the staged file (file just attached or attached
+    # earlier and the user is now typing /ingest). The ingest call is
+    # synchronous and can take minutes on a large PDF; render the user
+    # turn + a spinner BEFORE the blocking call so the page isn't frozen
+    # on the pre-submit state while the backend works.
+    if ingest_match and has_stage and role == ROLE_INTERNAL:
+        staged = st.session_state["staged_upload"]
+        arg = (ingest_match.group(1) or "").strip() or None
+        display_text = user_text or "/ingest"
+        attachment = {
+            "name": staged["name"],
+            "size_kb": max(1, len(staged["bytes"]) // 1024),
+            "ext": Path(staged["name"]).suffix.lower(),
+        }
+        st.session_state["messages"].append({
+            "role": "user",
+            "content": display_text,
+            "attachment": attachment,
+        })
         with st.chat_message("user"):
+            _render_attachment_card(attachment)
             st.markdown(display_text)
         with st.chat_message("assistant"):
+            spinner_label = (
+                f"Saving **{staged['name']}** to `data/raw/` and running "
+                f"ingest. This can take a few minutes on a long PDF — "
+                f"do not refresh the page."
+            )
+            with st.spinner(spinner_label):
+                reply = _commit_staged_upload(gi, staged, arg)
             st.markdown(reply)
+        st.session_state["staged_upload"] = None
         st.session_state["messages"].append({"role": "assistant", "content": reply})
         store.save_chat(
             active_conv_id, USER_ID_BY_ROLE[role], role, st.session_state["messages"],
         )
         gi.save()
+        st.rerun()
+        return
+
+    # Path B — file attached this turn but no /ingest yet: silently stash
+    # (the persistent indicator above the chat_input is the visual cue).
+    # If the user also typed something non-empty that isn't /ingest, fall
+    # through to the normal Q&A path so a typed question still gets
+    # answered with the attachment held for later.
+    if uploaded_file and role == ROLE_INTERNAL and not ingest_match and not user_text.strip():
+        # Empty text + just attached: rerun to show the indicator. The
+        # chat message log isn't touched — there's nothing to record yet.
         st.rerun()
         return
 

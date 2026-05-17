@@ -9,6 +9,18 @@ data/chats.db
 data/snapshots/
 results/
 
+# --- Eval framework: derived indices + audit snapshots (regenerable) ---
+eval/data/baseline_index/
+eval/data/node_bm25/
+eval/reports/relevance_dump.jsonl
+eval/reports/smoke_internal_v2.jsonl
+eval/reports/*.before_parity.*
+eval/reports/*.before_bm25.*
+eval/reports/*.before_3pool.*
+eval/reports/*.parity_v1.*
+eval/reports/raw_runs/*.before_*.jsonl
+eval/reports/raw_runs/*.parity_v1.jsonl
+
 # --- Secrets & env ---
 .env
 .env.local
