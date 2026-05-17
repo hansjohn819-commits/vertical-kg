@@ -195,11 +195,12 @@ class GraphStorage:
         dict round-trip; 142 nodes ≈ <10ms).
 
         Used so the §16.17 schema additions (`Node.text_unit_ids`,
-        `Edge.text_unit_ids`, `Edge.evidence_quote`) become accessible on
-        graphs that were saved before the schema change. The fields
-        default to empty list / empty string so the consistency check
-        treats old data as "no source-text linkage yet" — exactly what
-        we want until re-ingest.
+        `Edge.text_unit_ids`, `Edge.evidence_quote`) and the §16.19
+        addition (`Edge.original_type`) become accessible on graphs that
+        were saved before the schema change. The fields default to
+        empty list / empty string / None so legacy data reads as
+        "no source-text linkage / no stashed proposal yet" — exactly
+        what we want until re-ingest or 4e fills them in.
         """
         for nid, attrs in list(self._g.nodes(data=True)):
             n = attrs.get("data")
@@ -216,12 +217,20 @@ class GraphStorage:
             if e is None:
                 continue
             try:
-                e.text_unit_ids  # noqa: B018
-                e.evidence_quote  # noqa: B018
+                e.text_unit_ids       # noqa: B018
+                e.evidence_quote      # noqa: B018
+                e.original_type       # noqa: B018 — §16.19 addition
                 continue
             except AttributeError:
                 pass
-            attrs["data"] = Edge(**e.model_dump())
+            # model_dump() reads fields the class declares; legacy
+            # instances without the new attr simply omit it from the
+            # dump, and the constructor fills it from the default.
+            data = e.model_dump() if hasattr(e, "model_dump") else {}
+            for fld in ("source_id", "target_id", "type"):
+                if fld not in data:
+                    data[fld] = getattr(e, fld)
+            attrs["data"] = Edge(**data)
 
     # --- Stats ---
 
