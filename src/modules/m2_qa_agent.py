@@ -51,6 +51,7 @@ from src.graph.tokens import (
 from src.graph.traversal_log import append_query
 from src.llm.local_client import StreamEvent
 from src.llm.routing import get_client
+from src.modules.m2_qa import _maybe_summarize_history
 
 # Budget for graph_query retrieval context (§12.5.2). With 128K context the
 # cap is generous; limit exists to guard against pathological cases (a hub
@@ -427,6 +428,9 @@ def fast_query_trace(instance: GraphInstance, question: str,
         touched_edge_ids=touched_edge_ids,
     )
 
+    # §16.1 token guard — collapse long history before composing.
+    history = _maybe_summarize_history(client, history, question)
+
     composer_messages: list[dict] = [
         {"role": "system", "content": EXTERNAL_COMPOSER_SYSTEM_PROMPT},
     ]
@@ -501,6 +505,9 @@ def fast_query_stream(instance: GraphInstance, question: str,
         touched_node_ids=sorted(included_ids),
         touched_edge_ids=touched_edge_ids,
     )
+
+    # §16.1 token guard — same as fast_query_trace, before streaming.
+    history = _maybe_summarize_history(client, history, question)
 
     composer_messages: list[dict] = [
         {"role": "system", "content": EXTERNAL_COMPOSER_SYSTEM_PROMPT},

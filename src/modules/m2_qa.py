@@ -769,6 +769,83 @@ def _oos_prefilter(agg: Aggregated) -> bool:
 # Step 6: composer
 # ---------------------------------------------------------------------------
 
+# §16.1 / §12.5 token guard. Backend has 128K context. Evidence may take
+# up to CHUNKS_BUDGET_TOKENS = 60K, generation output + system prompt +
+# safety overhead reserve ~10K, leaving ~58K for (history + question).
+# Past this the long-running conversation triggers an LLM auto-summary
+# that collapses the transcript into one synthetic system message.
+HISTORY_QUESTION_BUDGET_TOKENS = 58000
+
+SUMMARIZE_HISTORY_SYSTEM_PROMPT = """You are a conversation compressor.
+
+You will receive a transcript of an earlier conversation between a user
+and a knowledge-graph analyst assistant. Your job is to produce a
+concise summary that preserves everything the next turn might need:
+
+- The user's overall topic and what they are exploring.
+- Specific entities, numbers, names, places, or dates the user pinned
+  or the assistant cited.
+- Facts the assistant already stated, especially answers to past
+  questions the user might refer back to with pronouns.
+- Open threads — questions the user asked that were not fully
+  answered, or points they pushed back on.
+
+Drop pleasantries, restate-of-questions, scaffolding, and anything that
+won't help interpret the next message. Be terse. No headings, no bullet
+labels — one continuous compact paragraph. Aim for under 600 words but
+do not pad to reach it.
+"""
+
+
+def _maybe_summarize_history(client: LocalClient,
+                             history: list[dict] | None,
+                             question: str,
+                             *,
+                             budget: int = HISTORY_QUESTION_BUDGET_TOKENS,
+                             ) -> list[dict] | None:
+    """Return ``history`` unchanged if it fits the budget, otherwise
+    collapse it into one summary system-message via an LLM call.
+
+    The summary call uses ``thinking=False`` — compression is a
+    text-shape task, not a reasoning task — and a low temperature so
+    repeat calls on the same history stay stable. If the summarization
+    call itself fails for any reason, we degrade to the trivial fix of
+    dropping ``history`` entirely; the alternative (raising) would
+    crash the whole QA path and the user just asked one question.
+    """
+    if not history:
+        return history
+    h_tokens = sum(count_tokens(m.get("content", "") or "") for m in history)
+    q_tokens = count_tokens(question or "")
+    if h_tokens + q_tokens <= budget:
+        return history
+
+    transcript = "\n".join(
+        f"{(m.get('role') or 'user').upper()}: {m.get('content') or ''}"
+        for m in history
+    )
+    try:
+        resp = client.chat(
+            messages=[
+                {"role": "system", "content": SUMMARIZE_HISTORY_SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ],
+            temperature=0.1, thinking=False,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        summary = ""
+    if not summary:
+        # Fall back to dropping history rather than crashing the whole
+        # composer call. The current question still has full evidence;
+        # losing transcript context is a downgrade, not a failure.
+        return None
+    return [{
+        "role": "system",
+        "content": f"Earlier conversation summary:\n{summary}",
+    }]
+
+
 def _composer_messages(evidence_text: str, question: str,
                        history: list[dict] | None = None) -> list[dict]:
     msgs: list[dict] = [{"role": "system", "content": COMPOSER_SYSTEM_PROMPT}]
@@ -868,6 +945,11 @@ def qa_trace(instance: GraphInstance, question: str,
     except Exception:
         pass  # logging is best-effort
 
+    # §16.1 token guard — collapse history if (history + question) would
+    # blow the context budget. Happens before the composer call so the
+    # actual LLM request always fits within the model window.
+    history = _maybe_summarize_history(client, history, question)
+
     t0 = time.time()
     composer_failed = False
     try:
@@ -961,6 +1043,9 @@ def qa_stream(instance: GraphInstance, question: str,
         )
     except Exception:
         pass  # logging is best-effort
+
+    # §16.1 token guard — same as qa_trace, before the streaming call.
+    history = _maybe_summarize_history(client, history, question)
 
     collected: list[str] = []
     try:
