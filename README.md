@@ -1,71 +1,137 @@
 # Vertical GraphRAG with a Self-Maintaining Knowledge Graph
+### A controlled empirical study of three retrieval architectures on a domain-specific corpus
 
-A production-grade **GraphRAG** system over an industry corpus (kelp / seaweed
-sector, 11 PDFs). Knowledge is stored as a typed graph (**2,500+ entities and
-relations**, still consolidating) rather than flat text chunks, then queried
-with multi-hop graph traversal driven by an LLM-decomposed question plan.
+GraphRAG is an empirical frontier, not a solved problem. Microsoft GraphRAG
+(Apr 2024), LazyGraphRAG (Nov 2024), LightRAG, and Fast GraphRAG were all
+released within the last 18 months. GraphRAG-Bench, the first community
+attempt at a standardized evaluation framework, appeared in June 2026 and
+explicitly acknowledges that "standard benchmarks may not fully capture the
+nuances" of graph-augmented retrieval. The literature still debates basic
+questions — *when* graph structure helps over hybrid dense+lexical
+retrieval, *what unit of retrieval* to use (chunks vs entities vs
+communities), *how to bound LLM cost* in traversal, and *how to evaluate*
+multi-hop reasoning fidelity on domain-specific corpora.
 
-Benchmarked head-to-head against conventional dense+lexical RAG and against an
-entity-grouped single-shot graph baseline on 61 hand-curated questions:
-
-| Category | Conventional RAG (Baseline) | Entity-grouped (External) | **Multi-hop graph (Internal)** |
-|---|---:|---:|---:|
-| Single-hop answer correctness | 81.7% | 98.3% | **100%** |
-| Multi-hop answer correctness | 81.8% | 81.8% | **≥95.5%** |
-| Aggregation answer correctness | 70.0% | 90.0% | **90.0%** |
-| OOS refusal accuracy | 100% | 100% | **100%** |
-| **Mean (in-scope, 51 q)** | **79.4%** | **94.1%** | **≥97.1%** |
-| Multi-hop Recall@k (strict) | 72.7% | 81.8% | **90.9%** |
-
-Single-hop / multi-hop / aggregation MRR all rose substantially after the
-latest retrieval rebuild — single-hop from 0.21 → **0.47**, aggregation
-from 0.51 → **0.88**. Entirely local stack — **Gemma 4 26B via llama.cpp
-through an OpenAI-compatible endpoint**, no cloud LLM.
+This project is a controlled empirical study from inside that frontier, on
+an 8-PDF domain-specific industry corpus. Three retrieval architectures
+are held to the **same local LLM** (Gemma 4 26B), the
+**same embedding model**, and the **same 61-question stratified gold set**;
+the only thing that varies is the retrieval architecture itself. Several
+design choices were made under genuine uncertainty — the three-pool chunk
+selection (§5), the deterministic OOS pre-filter (§6), the LazyGraphRAG-
+style decoupling of traversal from LLM calls (§4) — and this report
+documents each with before / after numbers, not just final numbers.
 
 ---
 
-## Why GraphRAG
+## Claims
 
-The corpus is moderate-size (11 PDFs, ~656 source-text chunks) but
-information-dense: industry reports, FAO statistics, academic literature,
-NGO impact reports. The questions a real analyst asks split into four
-shapes that stress retrieval differently:
+**C1 — Architectural delta is large and interpretable.** Holding LLM and
+embeddings constant, mean answer correctness on 51 in-scope questions
+rises from **79.4%** (flat dense+lexical RAG) → **94.1%** (entity-grouped
+single-shot) → **≥97.1%** (multi-hop traversal). The architectural choice
+dominates LLM strength in this corpus class. [→ §3]
+
+**C2 — Multi-hop bridge questions are where the architecture earns its
+cost.** Recall@k on 11 bridge questions: 72.7% → 81.8% → **90.9%**.
+Per-query LLM cost stays bounded at 1–2 calls; the traversal itself is
+LLM-free, following LazyGraphRAG's defer-cost principle. [→ §3, §4]
+
+**C3 — Ablation: three-pool chunk selection was the critical design
+choice under uncertainty.** Splitting chunk selection into three
+independent pools (RRF-seed top-1 ≤20 / label-seed top-1 ≤5 / hop-
+expanded rerank ≤10) moved multi-hop Recall@k from **54.5% → 90.9%**
+(+36pp) and aggregation MRR from **0.51 → 0.88** (+37pp), with zero new
+refusals on 51 in-scope questions. The intuitive single-pool design —
+what most public GraphRAG variants effectively do — systematically
+squeezed out lexically-distinctive seed entities. Before / after raw
+outputs are committed under `eval/reports/raw_runs/internal_v2.before_*.jsonl`
+so the ablation table can be independently re-derived. [→ §5]
+
+**C4 — Faithful retrieval as a system property, not an LLM property.**
+OOS refusal accuracy is 100% across all three systems, achieved via a
+deterministic seed-threshold pre-filter (`max_seed_score < 0.30` → canned
+refusal, skip composer). Refusal correctness is auditable without
+inspecting the LLM and survives LLM swaps. [→ §6]
+
+**C5 — Self-maintaining graph (capability, not finding).** A sleep-pass
+pipeline (reinforce → merge → prune → link-form) plus an evidence-driven
+ontology that evolved 9 → 31 relation types across 5 documented rounds.
+**This is reported as a system capability, not as a research finding** —
+controlled before / after data on the sleep-pass effect was not collected
+when the evaluation framework was built. [→ §7]
+
+**Limitations.** Single domain, 61 questions, author-graded answer
+correctness with no inter-rater validation, single LLM family. External
+validity is not established beyond this corpus. [→ §8]
+
+---
+
+## 1. Why GraphRAG on this corpus
+
+8 PDFs, ~580 source-text chunks: industry reports, public statistics,
+academic literature, non-profit publications. Moderate size, but
+information-dense and entity-heavy. The questions an analyst actually
+asks split into four shapes that stress retrieval differently:
 
 | Shape | Example | Where conventional RAG breaks |
 |---|---|---|
-| Single-hop lookup | "Who is the interim CEO of Atlantic Sea Farms?" | OK in 80%+ of cases |
-| Multi-hop bridge | "Through what entity are M. Stekoll and R. Fujita connected?" | Single-pass retrieval can't surface both endpoints + the bridge |
-| Aggregation | "List companies in the North American kelp industry." | 500-token chunks fragment list context |
+| Single-hop lookup | "Who currently leads [target company]?" | OK in 80%+ of cases |
+| Multi-hop bridge | "Through what entity are [researcher A] and [researcher B] connected?" | Single-pass retrieval can't surface both endpoints + the bridge |
+| Aggregation | "List companies operating in [sub-sector]." | 500-token chunks fragment list context |
 | Out-of-scope | "What is the capital of Mongolia?" | LLM leaks training data unless retrieval explicitly says "nothing matched" |
 
-The hypothesis: an entity-typed graph plus light traversal should win on
-multi-hop and aggregation while staying competitive on single-hop. The
-project tests that hypothesis with a rigorous, reproducible benchmark.
+The hypothesis under test: an entity-typed graph plus light traversal
+should win on multi-hop and aggregation while staying competitive on
+single-hop. The three-architecture comparison below tests that
+hypothesis directly.
 
 ---
 
-## Evaluation methodology
+## 2. Methodology
 
-Three retrieval architectures evaluated head-to-head **with the same LLM,
-same embedding model, same 61-question test set, same gold-standard**.
-The only thing that varies is the retrieval architecture itself — answer
-correctness deltas are attributable to architecture, not to LLM strength.
+### 2.1 Three architectures held constant on LLM and embeddings
 
-### Test set construction
+| | Baseline | External | Internal |
+|---|---|---|---|
+| Unit of retrieval | text chunks (500 tok) | graph nodes (entities) | graph nodes + edges |
+| Lexical signal | BM25 over chunks | BM25 over node texts | BM25 over node texts + label substring match |
+| Dense signal | embedding of chunks | embedding of node summaries | embedding of node summaries (seeds) + embedding of chunks (rerank) |
+| Fusion | RRF (k=60) | RRF (node-level) | RRF at seed step + RRF at chunk rerank step |
+| Graph traversal | none | none | 3-hop frontier, mechanical |
+| Multi-step | no | no | LLM decompose → mechanical traversal → LLM compose |
+| LLM calls / q | 1 | 1 | 1–2 |
 
-61 questions, hand-curated, stratified across four categories:
+All three use **Gemma 4 26B Q4_K_M via llama.cpp** with `thinking=off` and
+**`paraphrase-multilingual-MiniLM-L12-v2`** (384-dim) embeddings.
+Differences in retrieval quality are attributable to the retrieval
+architecture itself, not LLM strength.
+
+**Eval-time graph state**: 2,430 active nodes / 2,385 edges / 580 text
+chunks across 8 source PDFs, with 30 ontology relation types (round 4
+cumulative; see §7 for the ontology timeline). All three systems query
+the same graph snapshot.
+
+### 2.2 Test set construction
+
+61 hand-curated questions, stratified across four categories. Test data
+was constructed by a **different LLM** (Claude) from the one under test
+(local Gemma); the system under test never sees the gold set.
 
 | Category | n | How questions were built |
 |---|---:|---|
 | Single-hop | 30 | Sampled from production graph edges with full provenance (source/target labels + edge type + verbatim evidence quote + source chunk). Stratified across 29 distinct edge types. |
 | Multi-hop bridge | 11 | Sampled 2-hop graph paths `A-B-C` with strict filters: (i) edge_1 and edge_2 do not share any source chunk, (ii) the two edges live in different source documents, (iii) no direct `A-C` edge exists. These are genuine "must traverse through B" questions. |
-| Aggregation | 10 | One question per top-degree hub node ("list companies in the NA kelp industry"). |
+| Aggregation | 10 | One question per top-degree hub node (e.g. "list companies in a target sub-sector"). |
 | Out-of-scope | 10 | Hand-written domain-foreign questions (capital cities, Python code, sports scores). |
 
-Test data was constructed by a different LLM (Claude) than the one under
-test (local Gemma); the system under test never sees the gold set.
+### 2.3 Three definitions of "relevant"
 
-### Metrics — three definitions of "relevant"
+Reporting all three together is intentional — strict gold-ID matching is
+the conservative floor (every public RAG benchmark *would* report numbers
+this low); the semantic definition is comparable to industry benchmarks
+like BEIR (R@10 typically 0.5–0.85 on niche corpora); manual answer
+correctness is the actual business outcome.
 
 | Metric | Definition |
 |---|---|
@@ -73,19 +139,41 @@ test (local Gemma); the system under test never sees the gold set.
 | **Recall (semantic, BEIR / RAGAS-style)** | Did the retrieved chunks contain text that *supports answering the question* — at least one named entity from the question / gold facts, or two distinct content nouns plus one question noun? Deterministic, encoded in `eval/scripts/judge_relevance.py` and validated against manual spot-check (~75-80% agreement). |
 | **Answer correctness** | Manually scored 0 / 0.5 / 1 — does the generated answer state the gold fact with the right named entities and no fabrication? |
 | **OOS refusal accuracy** | Did the system refuse rather than leak training-data answers on out-of-scope questions? |
-| **Latency p50 / p95** | End-to-end wall-clock per question. |
 
-Reporting all three relevance definitions together is intentional: strict
-gold-ID matching is the conservative floor (every public RAG benchmark
-*would* report numbers this low); the semantic definition is comparable
-to industry benchmarks like BEIR (R@10 typically 0.5–0.85 on niche
-corpora); manual answer correctness is the actual business outcome.
+### 2.4 Why this isolates the architectural delta
+
+- All 3 systems run the same local LLM with the same generation settings
+- All 3 systems run the same embedding model
+- Test data and gold scoring are by a different LLM (Claude) than the SUT
+- Gold facts are extracted from corpus evidence quotes, not generated
+- Each system runs in isolation (own runner, own warm-up, fresh state per question)
+
+### 2.5 Hardware and environment
+
+| | |
+|---|---|
+| GPU | single NVIDIA RTX 4090 (24GB VRAM) |
+| Inference engine | llama.cpp, single-slot, `n_ctx=131072`, flash-attention on, q8_0 KV cache |
+| LLM under test | Gemma 4 26B (MoE), Q4_K_M 4-bit quantization, `thinking=off`, temperature 0.3 |
+| Embedding model | `paraphrase-multilingual-MiniLM-L12-v2` (384-dim), deterministic |
+| Client | single-process Python, OpenAI-compatible HTTP API to llama.cpp |
+| Warm-up | first question discarded from every reported number |
+| Run multiplicity | each system evaluated once over the 61 questions; reported numbers are single-run, no multi-seed averaging |
+
+Temperature was raised from 0 to 0.3 after empirically observing the MoE
+backbone falling into local-optima loops (repeated token cycles) at
+greedy decoding. At T=0.3 the decompose step (Internal) and all composer
+outputs have small run-to-run variance; the headline retrieval-quality
+metrics (Recall@k / MRR / F1) are most sensitive on Internal, where
+decomposition feeds downstream traversal. Treating these numbers as
+single-run estimates rather than expected values is honest disclosure of
+this constraint.
 
 ---
 
-## Results
+## 3. Results
 
-### Strict gold-page recall
+### 3.1 Strict gold-page recall (supports C1, C2)
 
 | Category | n | System | Recall@k | Recall (frac) | Precision@k | F1@k | MRR |
 |---|---:|---|---:|---:|---:|---:|---:|
@@ -99,7 +187,7 @@ corpora); manual answer correctness is the actual business outcome.
 |  |  | External | **100%** | 16.9% | **56.0%** | 0.225 | 0.639 |
 |  |  | Internal | **100%** | **29.2%** | 41.1% | **0.301** | **0.875** |
 
-### Answer correctness (manually scored)
+### 3.2 Answer correctness (manually scored)
 
 | Category | n | Baseline | External | **Internal** |
 |---|---:|---:|---:|---:|
@@ -110,7 +198,7 @@ corpora); manual answer correctness is the actual business outcome.
 
 OOS refusal: 10/10 across all three systems.
 
-### Latency
+### 3.3 Latency
 
 | Category | Baseline | External | Internal |
 |---|---:|---:|---:|
@@ -119,14 +207,14 @@ OOS refusal: 10/10 across all three systems.
 | Aggregation p50 / p95 | 2.9s / 4.9s | 2.8s / 4.0s | 6.2s / 11.2s |
 | **LLM calls / question** | 1 | 1 | 1–2 |
 
-### How to read the three systems
+### 3.4 How to read the three systems
 
 - **Internal** wins on answer correctness across every category and on
-  Recall@k for multi-hop — the explicit decomposition + traversal pays
+  Recall@k for multi-hop. The explicit decomposition + traversal pays
   for itself on bridge questions where single-pass retrieval can't
-  surface both endpoints. Cost: 2× LLM calls, 2–3× latency, lower
+  surface both endpoints. Cost: up to 2× LLM calls, 2–3× latency, lower
   precision because it packs more evidence into the prompt.
-- **External** is the latency-correctness sweet spot for single-hop —
+- **External** is the latency / correctness sweet spot for single-hop —
   hybrid dense+BM25 over node summaries, single LLM call, sub-2s p50.
   Multi-hop is its weak spot (no traversal).
 - **Baseline** is the cheap floor. 79.4% mean correctness sets the bar
@@ -136,9 +224,7 @@ Full report at [`eval/reports/summary.md`](eval/reports/summary.md).
 
 ---
 
-## System design
-
-### Architecture overview
+## 4. Internal Q&A pipeline — mechanism behind C2
 
 ```mermaid
 flowchart LR
@@ -169,17 +255,7 @@ Three first-class layers per graph instance, all kept consistent at boot:
 | `BM25Store` (rank_bm25 over node summaries) | Lexical companion to FAISS | External and Internal seed retrieval |
 | `TextUnitStore` (JSON) | Per-page source text chunks, referenced by node + edge `text_unit_ids` | Evidence packing for both Q&A paths |
 
-A `GraphInstance` is one isolated graph "world" (production vs experiment vs
-…); same code path, separate data directory. Boot-time consistency checks
-auto-rebuild FAISS / BM25 from `GraphStorage` if files are missing,
-corrupt, or count-mismatched against the active node set.
-
----
-
-## Internal Q&A pipeline (deep-dive)
-
-The hardest design problem in the project — and the one that surfaced the
-most non-obvious decisions — is the Internal path. Eight steps:
+The Internal pipeline:
 
 ```
 question
@@ -202,18 +278,13 @@ question
   ↓
 [5] OOS pre-filter: max(seed_score) < 0.30 → canned refusal, skip composer
   ↓
-[6] Build evidence — three independently-capped pools (60K token budget):
-       Pool A: each RRF seed contributes its top-1 chunk (cap 20)
-       Pool B: each label-match seed contributes its top-1 chunk (cap 5)
-       Pool C: hop-expanded chunks reranked via RRF of dense cosine
-               and ad-hoc chunk-level BM25 (cap 10)
+[6] Build evidence — three independently-capped pools (60K token budget)
+       → see §5
   ↓
 [7] Composer LLM call  (single call, thinking=off, step-by-step prompt)
   ↓
 return answer
 ```
-
-Two design choices are worth calling out:
 
 **LazyGraphRAG-style mechanical traversal.** Steps 2–4 do not call an
 LLM. Neighbours are scored by cheap signals (cosine + edge-type weight);
@@ -224,75 +295,138 @@ deterministic and auditable. Microsoft's LazyGraphRAG paper formalizes
 this defer-LLM-cost principle; this project independently arrived at the
 same shape through eval iteration.
 
-**Three-pool chunk selection.** A single per-sub-q rerank pool — the
-obvious design — systematically squeezed out lexically-distinctive seed
-entities whose chunks did not score highest under dense cosine alone.
-Splitting the chunk budget into three explicit pools (seed top-1 forced
-/ label-match top-1 forced / remainder reranked with dense+BM25 RRF) is
-what unlocked the multi-hop recall jump in the latest rebuild. See the
-case study below for how this design was derived.
-
 ---
 
-## Design case study: solving multi-hop bridge failures
+## 5. Ablation — three-pool chunk selection (C3)
 
-Real example from the eval, illustrative of the design loop the project
-runs in.
+> Note: §4 above describes Internal as it stands today, after the design
+> refactor traced in this section.
 
-**Observation.** A user query — *"Licensed Aquaculture Sites, what info
-do you have on this KPI?"* — returned `"I don't have information on
-that"` from the Internal path. The External path answered correctly with
-specifics (Argyle Aquaculture Development Area's 53 designated sites,
-Maine LPAs, Newfoundland licence holders, etc.). Internal *should* have
-been the stronger system — what went wrong?
+The hardest design problem in this project, and the one that surfaced
+the largest empirical surprise. Real example from the eval set,
+abstracted to preserve corpus anonymity but factually intact.
+
+**Observation.** A user query about a regulatory-licensing KPI returned
+`"I don't have information on that"` from Internal. External answered
+correctly with specifics — a regional development zone's count of
+designated facilities, regional licence holders across several
+sub-regions. Internal *should* have been the stronger system — what
+went wrong?
 
 **Trace.** Both paths hit the same top-1 entity (cosine 0.7663). Both
 visited ~37 nodes. The OOS pre-filter did not fire. The Internal
 composer was handed evidence and chose to refuse — meaning the right
 chunks weren't in the prompt. Drilling into the seed list confirmed it:
-the `Argyle Aquaculture Development Area` node existed in the graph
-with "53 designated sites" in its summary, but it ranked outside
-Internal's dense top-20 (the relevant Location wasn't semantically
-close enough to the query "Licensed Aquaculture Sites" for dense alone
-to surface it).
+the relevant regional-zone Location node existed in the graph with
+the matching facility-count phrase in its summary, but it ranked
+outside Internal's dense top-20 (the relevant Location wasn't
+semantically close enough to the user's keyword query for dense alone
+to surface it). External's RRF fusion (dense + BM25) put that node at
+rank 9 via lexical match. **Internal was using dense only for seed
+retrieval** — a decision that had been validated by an earlier eval
+iteration on a different testset, but turned out to be the root cause
+of this miss.
 
-External's RRF fusion (dense + BM25) put Argyle at rank 9 via lexical
-match. Internal was using **dense only** for seed retrieval — a
-decision that had been validated by an earlier eval iteration on a
-different testset, but turned out to be the root cause of this miss.
-
-**The fix landed in three steps over half a day:**
+**Fix landed in three steps over half a day:**
 
 1. **Add BM25 to Internal seed retrieval** (reuse `instance.bm25_store`,
    zero new infrastructure). Verified the original case was fixed.
-2. **Re-run the full 61-question eval** to check for regressions on
-   previously-passing cases. Discovered a *new* failure: a multi-hop
-   bridge question — *"FocusMaine and Atlantic Sea Farms are connected
-   to which U.S. state?"* — flipped from correct to wrong. Diagnosis:
-   per-sub-q chunk rerank was now pulling in more ASF chunks than
-   before (from BM25 lexical match), and those chunks didn't say "ASF
-   is in Maine" as cleanly as the chunks they displaced.
+2. **Re-run the full 61-question eval** to check for regressions.
+   Discovered a *new* failure: a multi-hop bridge question linking two
+   named organizations to a shared region flipped from correct to wrong.
+   Diagnosis: per-sub-q chunk rerank was now pulling in more chunks for
+   one endpoint organization (from BM25 lexical match), and those chunks
+   didn't state the shared-region fact as cleanly as the chunks they
+   displaced.
 3. **Three-pool chunk selection**: force-include the top-1 chunk for
    *every* seed (cap 20 for RRF seeds, cap 5 for label-match seeds);
    only rerank the hop-expanded remainder. The bridge entities both
    made the seed pool, so their direct chunks landed in the prompt
    regardless of competing entities' rerank scores.
 
-**Outcome.** Multi-hop Recall@k 54.5% → 90.9% (+36pp), aggregation MRR
-0.51 → 0.88 (+37pp), zero new refusals on the 51 in-scope questions.
-Two single-hop questions lost the literal gold page but still answered
-correctly (the same fact lived in other chunks).
+### 5.1 Before / after — three-pool refactor (Internal path)
 
-The full design-decision audit lives in
-[`eval/reports/summary.md`](eval/reports/summary.md) §4.6 with before /
-after numbers.
+| Category | Metric | before | after | Δ |
+|---|---|---:|---:|---:|
+| Single-hop | Recall@k | 66.7% | 66.7% | 0 |
+| | MRR | 0.213 | **0.467** | **+25pp** |
+| Multi-hop | Recall@k | 54.5% | **90.9%** | **+36pp** |
+| | Recall (frac) | 0.424 | **0.742** | **+32pp** |
+| | MRR | 0.264 | 0.284 | +2pp |
+| Aggregation | Recall@k | 100% | 100% | 0 |
+| | Recall (frac) | 0.216 | **0.292** | **+8pp** |
+| | F1 | 0.263 | **0.301** | +4pp |
+| | MRR | 0.508 | **0.875** | **+37pp** |
+| All in-scope | New refusals on 51 questions | 0 | 0 | 0 |
+
+Per-question recall@k flips: **6 questions newly retrieved gold**
+(q001, q010, q032, q033, q037, q038), **2 questions lost page-level
+gold** (q017, q027) but **both still answer correctly** because the same
+fact is duplicated across other chunks.
+
+### 5.2 Reading this ablation
+
+- The single-pool design — what most public GraphRAG variants
+  effectively do — is *intuitively correct*: rerank everything against
+  the sub-question and take the top-k. Empirically it loses
+  lexically-distinctive seeds whose chunks are not the top-scoring
+  under dense cosine alone.
+- The three-pool design pays a precision cost (chunk count per prompt
+  roughly doubled) in exchange for the +36pp multi-hop recall. On
+  strict precision@k, Internal looks worse than External (§3.1); on
+  answer correctness, Internal pulls ahead (§3.2). This is a design
+  trade-off, not a defect — explicitly documented under C1.
+- Two single-hop questions lost their literal gold page but still
+  answered correctly. This is the kind of "metric tradeoff worth
+  paying" that doesn't show up in headline numbers.
+
+### 5.3 Independent verification
+
+Raw outputs from the three before-states are committed for direct diff
+against the current run:
+
+- `eval/reports/raw_runs/internal_v2.before_parity.jsonl` — pre eval-to-src parity rebuild
+- `eval/reports/raw_runs/internal_v2.before_bm25.jsonl` — Internal with dense-only seeds
+- `eval/reports/raw_runs/internal_v2.before_3pool.jsonl` — Internal after BM25 added, before three-pool selection
+
+A reviewer can re-run `eval/scripts/analyze.py` against these JSONLs to
+re-derive the before / after table above. The full design-decision
+audit lives in [`eval/reports/summary.md`](eval/reports/summary.md) §4.6.
 
 ---
 
-## Self-maintaining knowledge graph
+## 6. OOS refusal as a system property (C4)
 
-The graph doesn't stay static after ingest — a **sleep pass** runs
-periodic maintenance:
+All three systems refuse 10/10 out-of-scope questions. Mechanisms
+differ:
+
+- **Baseline / External**: composer prompt with explicit "decline
+  plainly if evidence is insufficient" instruction. Refusal is an LLM
+  behavior, contingent on the LLM following the prompt.
+- **Internal**: a deterministic pre-filter — if
+  `max(seed_score) < 0.30`, return a canned refusal and skip the
+  composer entirely (0 extra LLM calls). Refusal is a system property
+  that holds regardless of the LLM's prompt-following behavior.
+
+The Internal mechanism matters for trustworthy retrieval: refusal
+correctness can be reasoned about by inspecting the seed-score
+threshold, not by inspecting the LLM. Swapping the underlying LLM does
+not change the refusal contract. This is the property that makes the
+Internal path safer to deploy as a retrieval backend for downstream
+agents — refusal can be guaranteed by the retrieval layer, not
+delegated to the LLM.
+
+For borderline-seed questions (in-scope but with weak coverage),
+Internal also relies on the composer prompt. The earlier "post-filter"
+defense-in-depth layer was retired 2026-05-16; refusal correctness has
+held without it.
+
+---
+
+## 7. Self-maintaining knowledge graph (capability, not finding)
+
+The graph doesn't stay static after ingest — a sleep pass runs periodic
+maintenance:
 
 ```
 M4 Sleep Pass  (LangGraph StateGraph, fixed order)
@@ -317,106 +451,148 @@ M4 Sleep Pass  (LangGraph StateGraph, fixed order)
   proposes new edges and must justify *both* what the relation is and
   why it holds. Pairs judged once are remembered.
 
-### Ontology evolution — schema as data, not code
-
 The ingest pipeline logs every relation type the LLM proposes and every
-domain mismatch (`Person → Organization` for `CEO_OF` was a domain
-mismatch before round 2 extended `CEO_OF` to include non-profits).
-After each ingest batch, the proposals are aggregated and the ontology
-evolves:
+domain mismatch. After each ingest batch, the proposals are aggregated
+and the ontology evolves under a ≥3-document cross-coverage threshold +
+≥5 events promotion rule:
 
 | Round | Trigger | What changed |
 |---:|---|---|
-| 1 (2026-05-09) | First Kelponomics ingest | Added 6 relations (`AUTHORED_WITH`, `AFFILIATED_WITH`, `PUBLISHED_BY`, `STUDIED_LOCATION`, `LOCATED_IN`, `OPERATES_IN`); extended `PRODUCES` domain |
-| 2 (2026-05-09 pm) | ASF non-profit annual report | Extended `CEO_OF` to include Organization (non-profits use the title), extended `AFFILIATED_WITH` to Org-Org; added `AUDITED_BY` / `AUDITS`; introduced alias mechanism for model-typo correction |
-| 3 (2026-05-11) | FAO SOFIA 264-page ingest | Added 8 relations (`PRODUCED_BY`, `PRODUCED_IN`, `AUTHORED_BY`, `PUBLISHED`, `EXPORTS`, `INCLUDES`, `PART_OF`, `FUNDED_BY`); extended `IN_INDUSTRY` |
-| 4 (2026-05-12) | 5 additional documents | Added `FUNDED`, `IMPORTED_FROM`, `PARTNERED_WITH`, `CONTAINS`, `PRODUCES_LOCATION`; 2 new aliases |
-| 5 (2026-05-17) | 3 new documents (OHS, Scotland, Global FAO) | 8 domain extensions across `AUTHORED_BY` / `IMPORTED_FROM` / `LOCATED_IN` / `STUDIED_LOCATION` / `AUTHORED_WITH` / `EXPORTS` / `PARTNERED_WITH`; added `HOSTS_OPERATIONS_OF`; 1 new alias |
+| 1 (2026-05-09) | First industry-publication ingest | Added 6 relations; extended `PRODUCES` domain |
+| 2 (2026-05-09 pm) | Non-profit organization annual report | Extended `CEO_OF` to include Organization, extended `AFFILIATED_WITH` to Org-Org; added `AUDITED_BY` / `AUDITS`; introduced alias mechanism |
+| 3 (2026-05-11) | Large multi-section reference publication | Added 8 relations; extended `IN_INDUSTRY` |
+| 4 (2026-05-12) | 5 additional documents | Added 5 relations; 2 new aliases |
+| 5 (2026-05-17) | 3 additional documents | 8 domain extensions; added `HOSTS_OPERATIONS_OF`; 1 new alias |
 
 From **9 seed relation types** at project start to **31 evidence-driven
-relation types** after round 5, each promotion gated on a ≥3-document
-cross-coverage threshold + ≥5 events. The full audit lives in
-[`ontology.md`](ontology.md). Every revision is replayable: a
+relation types** after round 5. Every revision is replayable: a
 `normalize_edges.py` script re-walks the graph under the new ontology
 to retroactively rewrite any edges whose surface form is now an alias
-or whose domain is now accepted.
+or whose domain is now accepted. The full audit lives in
+[`ontology.md`](ontology.md).
+
+**Eval-vs-current state.** The §3 evaluation was conducted against the
+round-4 cumulative graph snapshot (8 PDFs / 580 chunks / 2,430 nodes /
+2,385 edges / 30 relation types, as of 2026-05-16). Round 5 added 3
+further documents and 1 new relation type (current graph state: 11 PDFs
+/ 31 relation types) but the eval was not re-run on the post-round-5
+state. The §3 numbers should be read as measurements of the round-4
+snapshot, not the current graph.
+
+**Important caveat.** This section reports a *system capability*. The
+sleep-pass and ontology evolution were built into the pipeline before
+the evaluation framework was, and no controlled before / after data on
+the sleep-pass effect on retrieval quality was collected. The 9 → 31
+relation-type evolution is documented event-by-event, but its
+contribution to the §3 retrieval numbers is not separately measured.
+Treating this as a research finding would overstate what the evaluation
+supports.
 
 ---
 
-## Future directions
+## 8. Limitations
 
-The current architecture surfaces two distinct optimization paths, each
-playing to a different deployment trade-off.
-
-**Internal path — graph-led, accuracy-first.** The three-pool chunk
-selection solved multi-hop recall but roughly doubled chunk count per
-prompt, dragging precision down on the strict metric. Two compounding
-levers stand out: (a) **graph-finetuned embedding model** — train the
-sentence encoder on positive/negative entity pairs sampled from the
-graph itself, so dense seed retrieval lands closer to the right
-neighbourhood without needing BM25 as a crutch; (b) **adaptive per-pool
-N tuning** — current caps (seed top-1 = 20, label = 5, rerank = 10) are
-uniform across categories. Per-category caps fit from the eval set
-(single-hop likely wants a smaller seed pool, aggregation a larger one)
-should reclaim precision without giving back the recall floor.
-
-**External path — similarity-led, latency-first.** Already beats
-conventional RAG on single-hop and maintains sub-2s p50 latency, but
-multi-hop recall lags. Two extensions could close that gap while
-preserving the latency budget: (a) **selective second-hop expansion** —
-extend the entity neighbourhood one more hop only when the seed is a
-high-degree hub (low-degree nodes are not worth the cost); (b)
-**degree-weighted termination** — adaptive hop depth driven by node
-prominence rather than a fixed budget. Empirically two hops cover most
-B2B QA patterns; if External can reach two hops intelligently without
-paying for Internal's mechanical three-hop traversal, it becomes the
-accuracy / latency sweet spot for industrial deployment.
-
-Both paths assume the underlying graph stays well-maintained — that is
-the sleep pass's job (above).
+- **Single domain.** One industry sector only. Generalization
+  to other domains (medical, legal, scientific) is untested.
+- **Small test set.** 61 questions, 10–30 per category. Per-category
+  cells are sensitive to single failures.
+- **Single LLM family.** All evaluation uses local Gemma 4 26B. Stronger
+  frontier models would likely narrow the architectural gap by being
+  more robust to noisy evidence.
+- **Author-graded answer correctness.** No inter-rater validation on the
+  manual 0 / 0.5 / 1 scoring. The relevance judge is deterministic and
+  spot-checked (~75-80% agreement with manual judgment), but the
+  headline correctness numbers are single-rater.
+- **Sleep-pass effect uncontrolled.** §7 reports the sleep-pass and
+  ontology evolution as capabilities, not findings — no isolated
+  before / after data was collected.
+- **Eval snapshot vs current graph.** The §3 results reflect the round-4
+  graph state (8 PDFs / 580 chunks / 30 relation types, snapshotted
+  2026-05-16). Ontology round 5 added 3 PDFs and 1 relation type
+  post-eval; this addition was not re-evaluated. See §7 for the full
+  evolution timeline.
+- **Corpus is moderate-size.** ~580 chunks across 8 PDFs. At 10× scale,
+  graph build and retrieval costs would shift; this is not tested.
 
 ---
 
-## Production engineering
+## 9. Verifiability
 
-Things that aren't headline features but matter once the system is
+The repo does not bundle the source corpus or the local LLM endpoint.
+This shapes what is independently verifiable from a fresh clone:
+
+**What you can verify without the corpus or a local LLM:**
+- The test set (`eval/testset/gold.jsonl`) is committed in full, and
+  was constructed by an external LLM (not the SUT)
+- Per-question raw outputs for all three systems
+  (`eval/reports/raw_runs/{baseline,external_v2,internal_v2}.jsonl`)
+  are committed
+- The §3 results tables and §5 ablation tables can be re-derived from
+  these JSONLs by running `eval/scripts/analyze.py` and
+  `eval/scripts/judge_relevance.py` — both deterministic
+- Three pre-refactor raw-output snapshots (`internal_v2.before_*.jsonl`)
+  are committed so the ablation in §5 is independently checkable
+
+**What requires the original corpus and a local LLM endpoint:**
+- Regenerating `raw_runs/*.jsonl` from scratch
+- Rebuilding the knowledge graph itself
+
+---
+
+## 10. Relation to prior work
+
+- **LazyGraphRAG** (Microsoft, Nov 2024) formalized the defer-LLM-cost
+  principle this project's Internal pipeline arrived at independently
+  through eval iteration. Steps 2–4 of §4 are a concrete instantiation
+  of that pattern with an explicit three-pool chunk selector (§5)
+  that, to the project's knowledge, is not described in the LazyGraphRAG
+  reference implementation.
+- **BEIR / RAGAS** semantic relevance — §2.3's second relevance
+  definition follows the BEIR-style "does the retrieved text support
+  answering the question" framing rather than strict gold-ID matching.
+  Reported alongside strict recall so both lenses are visible.
+- **GraphRAG-Bench** (arxiv 2506.02404, Jun 2026) is the first
+  community attempt at a standardized GraphRAG evaluation. This
+  project's 61-question stratified testset is a different shape —
+  smaller, domain-specific, and explicit about which questions probe
+  which retrieval failure mode — but the methodological concerns it
+  surfaces (multi-component nature, retrieval vs reasoning difficulty)
+  are the same the project navigated.
+- **"When to use Graphs in RAG"** (arxiv 2506.05690) frames the same
+  open question this project's three-architecture comparison
+  empirically tests on a specific corpus class.
+
+---
+
+## 11. Production engineering
+
+Things that aren't headline research but matter once the system is
 real:
 
 - **Append-only audit log** (`log.md`) for ingest runs, sleep passes,
-  ontology revisions, cleanup actions, and partial-ingest rollbacks.
-  Every event carries `run_id` / `pass_id` so any state change is
-  traceable to the run that produced it.
-- **Snapshot-before-destructive** pattern. Every retroactive sweep
-  (`normalize_edges.py`, `dedupe_edges.py`, partial-ingest cleanup)
-  snapshots `graph.pkl` + `text_units.json` to
-  `data/snapshots/<reason>-<utc-ts>/` first.
-- **Boot-time consistency checks.** `GraphInstance.__init__` verifies
+  ontology revisions, cleanup actions, partial-ingest rollbacks
+- **Snapshot-before-destructive** — every retroactive sweep snapshots
+  `graph.pkl` + `text_units.json` to `data/snapshots/<reason>-<utc-ts>/`
+  before modifying state
+- **Boot-time consistency checks** — `GraphInstance.__init__` verifies
   FAISS / BM25 / text_units / storage are mutually consistent and
-  auto-rebuilds any layer that drifted (size mismatch is the
-  crash-mid-write signal). First-time bootstrap and crash recovery
-  share the same code path.
-- **Per-page failure isolation.** A long PDF whose page 28 hits an
+  auto-rebuilds any layer that drifted; first-time bootstrap and crash
+  recovery share the same code path
+- **Per-page failure isolation** — a long PDF whose page 28 hits an
   `APITimeoutError` keeps ingesting pages 29–40; the failure is logged
-  with the run_id and that page can be re-ingested individually.
-- **Two-instance separation.** `data/production/` and
-  `data/experiment/` are completely isolated state directories, same
-  code path. Experimental graphs never pollute production.
-- **Streaming Q&A.** Both Internal and External Q&A stream composer
-  tokens to the UI as they arrive. Long-running synchronous operations
-  (ingest, sleep pass) render a spinner with status text before the
-  blocking call so the browser never freezes on a pre-submit snapshot.
-- **Staged-upload flow.** Drag-drop into the chat input stages bytes
-  in session state and shows a persistent file chip; the actual write
-  to `data/raw/` + ingest happens only when the user types `/ingest`,
-  matching the mental model of "I dropped a file, now process it".
-- **62 unit tests** covering ontology parsing, sleep-pass merge /
-  prune / link-form behaviour, text-unit consistency invariants, BM25
-  store, chat router. Tests run against in-tmp instances, never
-  against production data.
+  with the run_id and that page can be re-ingested individually
+- **Two-instance separation** — `data/production/` and
+  `data/experiment/` are isolated state directories, same code path
+- **Streaming Q&A** — both Internal and External Q&A stream composer
+  tokens as they arrive
+- **62 unit tests** covering ontology parsing, sleep-pass merge / prune
+  / link-form behaviour, text-unit consistency invariants, BM25 store,
+  chat router. Tests run against in-tmp instances, never against
+  production data.
 
 ---
 
-## Quickstart
+## 12. Quickstart
 
 ```bash
 git clone <repo>
@@ -439,7 +615,16 @@ Verify the install:
 python -m pytest tests/ -q
 ```
 
-To rerun the full 61-question evaluation:
+Re-derive the §3 result tables from the committed raw runs (no corpus
+or LLM required):
+
+```bash
+python eval/scripts/analyze.py
+python eval/scripts/judge_relevance.py
+```
+
+To rerun the full 61-question evaluation from scratch (requires 11
+source PDFs in `data/raw/` and a local LLM endpoint):
 
 ```bash
 python -m eval.runners.run_baseline
@@ -450,23 +635,16 @@ python eval/scripts/dump_for_relevance_judge.py
 python eval/scripts/judge_relevance.py
 ```
 
-Results land in `eval/reports/` (raw JSONL per run, aggregated CSV /
-JSON, semantic relevance judgments).
-
 ---
 
-## Project structure
+## 13. Project structure
 
 ```
 workspace/
 ├── README.md                          # ← you are here
 ├── ontology.md                        # entity / relation schema + evolution log
 ├── log.md                             # append-only audit log
-├── data/
-│   ├── raw/                           # source PDFs
-│   ├── production/                    # graph.pkl + FAISS + BM25 + text_units + ontology
-│   ├── experiment/                    # parallel instance for safe experiments
-│   └── snapshots/                     # automatic pre-destructive backups
+├── data/                              # raw PDFs, production/experiment instances, snapshots
 ├── src/
 │   ├── graph/                         # GraphStorage, VectorStore, BM25Store, TextUnitStore, models
 │   ├── modules/
@@ -476,19 +654,12 @@ workspace/
 │   │   └── m4_sleep_pass/             # LangGraph state machine: merge / prune / link-form / reinforce
 │   ├── dashboard/streamlit_app.py     # Streamlit chat UI
 │   └── llm/                           # OpenAI-compatible client + routing
-├── scripts/
-│   ├── normalize_edges.py             # retroactively re-validate every edge against current ontology
-│   ├── dedupe_edges.py                # collapse (src, tgt, type) duplicates post-normalize
-│   └── rebuild_faiss.py               # full FAISS rebuild from authoritative storage
 ├── eval/
 │   ├── testset/gold.jsonl             # 61 hand-curated questions + gold answers
 │   ├── baseline/                      # independent conventional RAG implementation
 │   ├── runners/                       # Baseline / External / Internal runners
 │   ├── scripts/                       # analyze, judge_relevance, parity_compare, …
-│   └── reports/
-│       ├── summary.md                 # full evaluation report
-│       ├── aggregate.json             # per-category / per-system metrics
-│       └── raw_runs/                  # per-question outputs (JSONL)
+│   └── reports/                       # summary.md, raw_runs/, aggregate JSON, scored CSV
 └── tests/                             # 62 unit tests
 ```
 

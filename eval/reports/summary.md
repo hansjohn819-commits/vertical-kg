@@ -1,11 +1,12 @@
 # Retrieval Evaluation: Graph-Grounded QA vs Conventional RAG
 
 **Date:** 2026-05-16 (Internal retrieval rebuilt — §16.22 eval-to-src parity + §16.23 three-pool chunk selection)
-**Domain:** Vertical knowledge graph over the kelp / seaweed industry
-**Corpus:** 8 PDFs in `data/raw/` (~580 source pages):
-FAO SOFIA 2024, ASF Impact Report 2024, Kelponomics, Maine Seaweed Benchmarking Report,
-State of the Kelp Industry Report Feb 2026, techno-economic analysis (TEA),
-Washington Seaweed Aquaculture Economic Potential Analysis Report, 2025 Impact Report.
+**Domain:** Vertical knowledge graph over a domain-specific industry sector
+**Corpus:** 8 PDFs in `data/raw/` (~580 source pages), comprising industry
+reports, public statistics, academic literature, a techno-economic
+analysis, and non-profit publications. Sources kept unnamed in this
+report by design; the corpus contents are not material to the
+architectural comparison.
 
 **Production knowledge graph:** 2,430 active nodes / 2,385 edges / 580 source-text chunks
 **LLM under test (all 3 systems):** local Gemma 4 26B Q4_K_M via OpenAI-compatible llama.cpp endpoint, `thinking=off`
@@ -52,7 +53,7 @@ Explicit multi-hop traversal driven by LLM-decomposed sub-questions:
 | Stage | Detail |
 |---|---|
 | **(1) Decompose** | LLM splits the question into 1-5 atomic sub-questions (e.g. multi-hop bridge questions → one sub-q per endpoint + one for the bridge). 1 LLM call, thinking=off, ~2-3s |
-| **(2) Per-sub-q seed retrieval** | For each sub-q: **hybrid dense+BM25 over node summaries fused via RRF (k=60), top-10 seeds** + **token-level label-substring matching** for capitalized entity names in the sub-q (up to 5 extra seeds). The BM25 leg shares `instance.bm25_store` with the External path — no new infrastructure. Label-match still acts as a disambiguation safety net for entities like `"Fujita, R."` that both dense and BM25 underweight. |
+| **(2) Per-sub-q seed retrieval** | For each sub-q: **hybrid dense+BM25 over node summaries fused via RRF (k=60), top-10 seeds** + **token-level label-substring matching** for capitalized entity names in the sub-q (up to 5 extra seeds). The BM25 leg shares `instance.bm25_store` with the External path — no new infrastructure. Label-match still acts as a disambiguation safety net for entities like initialized-name researchers (e.g. capitalized initials with a comma + period) that both dense and BM25 underweight. |
 | **(3) Mechanical k-hop traversal** | For each sub-q, expand the seed frontier 3 hops outward. **No LLM in the loop** — neighbors scored by `cosine(sub_q_emb, neighbor_emb) × edge_type_weight`, beam-width 8, frontier threshold 0.4. Edge weights: AUTHORED_WITH=1.5, RELATED_TO=0.7, default=1.0 |
 | **(4) Aggregate** | Union of all visited nodes across sub-qs. Edges collected = all edges with both endpoints in visited (deduped) |
 | **(5) OOS pre-filter** | If `max(seed_score) < 0.30`, no entity matched → return canned refusal, skip composer (0 extra LLM calls) |
@@ -62,7 +63,7 @@ Explicit multi-hop traversal driven by LLM-decomposed sub-questions:
 
 **LLM calls per question**: 1 (OOS pre-filter triggered) or 2 (decompose + compose).
 
-The design follows Microsoft LazyGraphRAG's principle: **defer LLM cost to the terminal answer step**; use cheap signals (embedding cosine, BM25, edge degree, label match) for routing. The three-pool refinement to step (6) is the §16.23 contribution: a single per-sub-q rerank pool (the previous design) systematically squeezed out lexically-distinctive RRF seeds whose chunks didn't score highest under dense cosine alone (e.g. `Argyle Aquaculture Development Area` for a `"Licensed Aquaculture Sites"` question, `FocusMaine` for an `"is FocusMaine in Maine"` question). Forcing per-seed representation while still reranking the remainder restores those signals without breaking the rerank-driven selection of bridge evidence.
+The design follows Microsoft LazyGraphRAG's principle: **defer LLM cost to the terminal answer step**; use cheap signals (embedding cosine, BM25, edge degree, label match) for routing. The three-pool refinement to step (6) is the §16.23 contribution: a single per-sub-q rerank pool (the previous design) systematically squeezed out lexically-distinctive RRF seeds whose chunks didn't score highest under dense cosine alone (concretely, a regional regulatory-zone Location for a licensing-KPI question, and a regional non-profit organization for a state-affiliation bridge question). Forcing per-seed representation while still reranking the remainder restores those signals without breaking the rerank-driven selection of bridge evidence.
 
 ### 1.4 Comparison table
 
@@ -89,7 +90,7 @@ The design follows Microsoft LazyGraphRAG's principle: **defer LLM cost to the t
 |---|---:|---|
 | Single-hop | 30 | Sampled from production graph edges with full provenance (source/target labels + edge type + `evidence_quote` + `text_unit_ids`). Stratified across 29 distinct edge types (AFFILIATED_WITH, CEO_OF, AUTHORED_WITH, etc.). Questions verbalize each edge as a natural fact lookup |
 | Multi-hop bridge | 11 | Sampled from 2-hop graph paths A-B-C with strict filters: (i) edge_1.text_unit_ids ∩ edge_2.text_unit_ids = ∅, (ii) edges live in different source documents, (iii) no direct A-C edge exists. These are genuine "you must traverse through B" questions |
-| Aggregation | 10 | One question per top-degree hub node, asking to list neighbors of a specific type (e.g. "list companies in the NA kelp industry") |
+| Aggregation | 10 | One question per top-degree hub node, asking to list neighbors of a specific type (e.g. "list companies operating in a target sub-sector") |
 | Out-of-scope | 10 | Hand-written domain-foreign questions (Mongolia capital, Python code, World Cup score, etc.) to test refusal behavior |
 
 **Gold for each question**: gold_chunk_ids + gold_evidence_pages + gold_facts + expected_behavior. Stored in `eval/testset/gold.jsonl`.
@@ -133,9 +134,24 @@ The design follows Microsoft LazyGraphRAG's principle: **defer LLM cost to the t
 
 ### 2.4 Hardware / environment
 
-- Single workstation, single-process Python
-- llama.cpp single-slot, n_ctx=131072, flash-attn on, q8_0 KV cache
-- All wall-clock numbers reported are real end-to-end (warm-up excluded, first question always discarded)
+| | |
+|---|---|
+| GPU | single NVIDIA RTX 4090 (24GB VRAM) |
+| Inference engine | llama.cpp, single-slot, `n_ctx=131072`, flash-attention on, q8_0 KV cache |
+| LLM under test | Gemma 4 26B (MoE), Q4_K_M 4-bit quantization, `thinking=off`, temperature 0.3 |
+| Embedding model | `paraphrase-multilingual-MiniLM-L12-v2` (384-dim), deterministic |
+| Client | single-process Python, OpenAI-compatible HTTP API to llama.cpp |
+| Warm-up | first question discarded from every reported number |
+| Run multiplicity | each system evaluated once over the 61 questions; reported numbers are single-run, no multi-seed averaging |
+
+Temperature was raised from 0 to 0.3 after empirically observing the MoE
+backbone falling into local-optima loops (repeated token cycles) at
+greedy decoding. At T=0.3 the decompose step (Internal) and all composer
+outputs have small run-to-run variance; the headline retrieval-quality
+metrics (Recall@k / MRR / F1) are most sensitive on Internal, where
+decomposition feeds downstream traversal. Treating these numbers as
+single-run estimates rather than expected values is honest disclosure of
+this constraint.
 
 ---
 
@@ -202,7 +218,7 @@ This is a design choice, not a defect: Internal's downstream answer correctness 
 
 ### 3.2 Answer quality (manually scored 0 / 0.5 / 1)
 
-The percentages below were last manually scored against the pre-§16.23 Internal run (see §4.6 for the retrieval before/after numbers). The §16.23 three-pool refactor fixed at least four previously-failing in-scope cases (q018 / q031 / q039 plus the user-reported `Licensed Aquaculture Sites` query) and introduced **zero new refusals** on the 51 in-scope questions, so Internal's mean correctness is **≥ 97.1%** on the new run — the table below should be read as a conservative lower bound pending a re-scoring pass.
+The percentages below were last manually scored against the pre-§16.23 Internal run (see §4.6 for the retrieval before/after numbers). The §16.23 three-pool refactor fixed at least four previously-failing in-scope cases (q018 / q031 / q039 plus a user-reported licensing-KPI query) and introduced **zero new refusals** on the 51 in-scope questions, so Internal's mean correctness is **≥ 97.1%** on the new run — the table below should be read as a conservative lower bound pending a re-scoring pass.
 
 | Category            |   n | Baseline | External | **Internal** |
 | ------------------- | --: | -------: | -------: | -----------: |
@@ -240,14 +256,15 @@ Internal is 1.5–2.5× slower than External and 2–4× slower than Baseline. T
 
 After the §16.23 three-pool refactor, Internal now leads on multi-hop retrieval too — Recall@k 90.9% (vs External 81.8%, Baseline 72.7%) and Recall (frac) 0.742 (vs External 0.621, Baseline 0.341). The mechanism: External must find both endpoints of a bridge in **one retrieval pass** against the original question, and the bridge entity has to appear in the seed set's chunks. Internal's LLM-decomposed sub-questions dedicate a sub-query to each endpoint, the three-pool design force-includes each seed's top-1 chunk so the bridge-relevant chunk can't be reranked away, and the per-sub-q aggregated visited set lets the two endpoint paths meet.
 
-Selected questions where Internal succeeds and the others fail:
+Selected questions where Internal succeeds and the others fail (question
+shapes preserved; entity names abstracted):
 
-| qid | Question | Baseline | External | Internal |
+| qid | Question shape | Baseline | External | Internal |
 |---|---|---|---|---|
-| q034 | R. Fujita and M. Stekoll common collaborator? | refused | refused | **Yarish, C.** ✓ |
-| q037 | Are Xue W and Island Institute both active in Maine? | partial | partial | **Yes, both** ✓ |
-| q039 | FocusMaine + Atlantic Sea Farms — both in which state? | refused | partial | **Maine** ✓ |
-| (user) | `"Licensed Aquaculture Sites, 这个 KPI 你有任何信息吗"` | n/a | partial | **Argyle 53 sites / Maine LPAs / NH / Quebec / Newfoundland** ✓ |
+| q034 | Common-collaborator bridge between two researchers | refused | refused | **third-researcher correctly identified** ✓ |
+| q037 | Dual-affiliation bridge: are two named entities both active in a target state? | partial | partial | **both confirmed** ✓ |
+| q039 | Two-organization → shared-state bridge | refused | partial | **shared state correctly identified** ✓ |
+| (user) | A regulatory-licensing KPI lookup | n/a | partial | **regional regulatory zone + multi-region licence holders listed** ✓ |
 
 ### 4.2 Internal also wins on single-hop MRR — chunks land at the top of the prompt
 
@@ -296,25 +313,25 @@ Selected worst-cases per system, illustrative not exhaustive.
 
 | qid | Failure | What happened |
 |---|---|---|
-| q001 | retrieval miss | Gold page (Washington seaweed regs, page 21) not in top-10; chunking boundary fell between context and answer |
-| q026 | named-entity miss | "Blue Evolution" doesn't appear in any baseline-retrieved chunk; entity name wasn't a strong lexical signal vs other seaweed company names |
-| q046 | wrong entities | Listed Kelp Blue / Running Tide as NA kelp companies — both real but not in our gold list of established farmers |
+| q001 | retrieval miss | Gold page (a regulatory document, page 21) not in top-10; chunking boundary fell between context and answer |
+| q026 | named-entity miss | A small-named industry company doesn't appear in any baseline-retrieved chunk; the entity name wasn't a strong lexical signal vs other industry company names |
+| q046 | wrong entities | Listed two real industry companies as members of the target sub-sector — both real but not in our gold list of established operators |
 
 ### External
 
 | qid | Failure | What happened |
 |---|---|---|
-| q036 | partial | Found FAO-UAE study; missed FAO-US studies because the FAO node's chunks didn't surface specific US examples |
-| q047 | wrong sub-population | Listed ASF general staff (Andrew Clarke, Heather Perry) but didn't single out Bill Taylor as ASF Canada President — node-level retrieval can't always sub-segment by "ASF Canada" vs "ASF general" |
+| q036 | partial | Found one regional case-study under a hub-organization node; missed other regional cases because the hub node's chunks didn't surface all regional examples |
+| q047 | wrong sub-population | Listed general-organization staff but didn't single out a regional-subsidiary president — node-level retrieval can't always sub-segment by "regional subsidiary" vs "general organization" |
 
 ### Internal
 
 | qid | Failure | What happened |
 |---|---|---|
-| q036 | partial (same as External) | Bridge UAE-FAO-US required FAO node's text_unit_ids to include both; the larger §16.23 pool widens FAO chunk coverage but the UAE-side specifics still dominate the seed top-1 |
-| q047 | partial (same as External) | ASF Canada vs ASF general — same node, no granularity to separate |
+| q036 | partial (same as External) | Bridge region-A → hub-organization → region-B required the hub node's text_unit_ids to include both; the larger §16.23 pool widens hub chunk coverage but region-A-side specifics still dominate the seed top-1 |
+| q047 | partial (same as External) | Regional subsidiary vs general organization — same node, no granularity to separate |
 
-The remaining failures share a fundamental constraint with External: **the production graph's entity granularity** (the ASF Canada vs ASF general distinction isn't a separate node, it's a within-node textual nuance). The three-pool refactor expands what each entity can contribute (Pool A guarantees the top-1 chunk; Pool C surfaces hop-expansion evidence) but cannot create granularity the graph itself doesn't have.
+The remaining failures share a fundamental constraint with External: **the production graph's entity granularity** (the regional-subsidiary vs general-organization distinction isn't a separate node, it's a within-node textual nuance). The three-pool refactor expands what each entity can contribute (Pool A guarantees the top-1 chunk; Pool C surfaces hop-expansion evidence) but cannot create granularity the graph itself doesn't have.
 
 ---
 
