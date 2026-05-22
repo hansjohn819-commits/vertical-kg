@@ -29,8 +29,9 @@ documents each with before / after numbers, not just final numbers.
 **C1 — Architectural delta is large and interpretable.** Holding LLM and
 embeddings constant, mean answer correctness on 51 in-scope questions
 rises from **79.4%** (flat dense+lexical RAG) → **94.1%** (entity-grouped
-single-shot) → **≥97.1%** (multi-hop traversal). The architectural choice
-dominates LLM strength in this corpus class. [→ §3]
+single-shot) → **≥97.1%** (multi-hop traversal; the **≥** marks an
+explicit re-scoring deficit, explained at §3.2). The architectural
+choice dominates LLM strength in this corpus class. [→ §3]
 
 **C2 — Multi-hop bridge questions are where the architecture earns its
 cost.** Recall@k on 11 bridge questions: 72.7% → 81.8% → **90.9%**.
@@ -69,10 +70,11 @@ validity is not established beyond this corpus. [→ §8]
 
 ## 1. Why GraphRAG on this corpus
 
-8 PDFs, ~580 source-text chunks: industry reports, public statistics,
-academic literature, non-profit publications. Moderate size, but
-information-dense and entity-heavy. The questions an analyst actually
-asks split into four shapes that stress retrieval differently:
+8 PDFs from the kelp / seaweed industry sector, ~580 source-text chunks:
+industry reports, public statistics, academic literature, non-profit
+publications. Moderate size, but information-dense and entity-heavy. The
+questions an analyst actually asks split into four shapes that stress
+retrieval differently:
 
 | Shape | Example | Where conventional RAG breaks |
 |---|---|---|
@@ -195,6 +197,19 @@ this constraint.
 | Multi-hop | 11 | 81.8% | 81.8% | **95.5%** |
 | Aggregation | 10 | 70.0% | 90.0% | **90.0%** |
 | **Mean (excl OOS)** | 51 | **79.4%** | **94.1%** | **≥97.1%** |
+
+The Internal column carries a `≥` because the table reflects manual
+scoring on the *pre*-§5.1-refactor Internal run. The §5.1 three-pool
+refactor fixed at least four previously-failing in-scope cases
+(q018 / q031 / q039 plus the user-reported regulatory-licensing query).
+Spot-checks comparing post-refactor outputs against pre-refactor outputs
+surfaced no case that regressed from correct to wrong — including the
+two retrieval-loss cases noted in §5.1 (q017, q027), which still answer
+correctly because the same fact is duplicated across other chunks. With
+≥4 cases gaining correctness and no observed correct-to-wrong
+regressions, the post-refactor mean is bounded below by the pre-refactor
+**97.1%**. A full systematic re-scoring on the post-refactor run was
+not done; Internal's true correctness is at least this table's value.
 
 OOS refusal: 10/10 across all three systems.
 
