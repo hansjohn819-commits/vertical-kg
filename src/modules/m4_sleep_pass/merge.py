@@ -264,7 +264,7 @@ def _judge_pair(client, storage: GraphStorage, a: Node, b: Node) -> dict:
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ],
-        temperature=0.0,
+        temperature=0.3,
     )
     return _parse_json_loose(resp.choices[0].message.content or "")
 
@@ -287,7 +287,7 @@ def _fuse(client, a: Node, b: Node) -> tuple[str, str]:
             {"role": "system", "content": FUSION_SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ],
-        temperature=0.1,
+        temperature=0.3,
         thinking=False,
     )
     parsed = _parse_json_loose(resp.choices[0].message.content or "")
@@ -398,7 +398,7 @@ def _vote_done(client, round_summary: str) -> bool:
             {"role": "system", "content": DONE_VOTE_SYSTEM_PROMPT},
             {"role": "user", "content": round_summary},
         ],
-        temperature=0.0,
+        temperature=0.3,
     )
     parsed = _parse_json_loose(resp.choices[0].message.content or "")
     return str(parsed.get("decision", "stop")).lower() == "stop"

@@ -356,7 +356,7 @@ def link_step(state: PassState, *, instance: GraphInstance) -> dict:
                         {"role": "system", "content": LINK_SYSTEM_PROMPT},
                         {"role": "user", "content": user},
                     ],
-                    temperature=0.1,
+                    temperature=0.3,
                     thinking=False,
                 )
             except Exception as exc:

@@ -317,7 +317,7 @@ def _rewrite_query_with_history(client, question: str,
                 {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0.0,
+            temperature=0.3,
             thinking=False,
             timeout=30,
         )
@@ -442,7 +442,7 @@ def fast_query_trace(instance: GraphInstance, question: str,
     })
     t0 = time.time()
     resp = client.chat(
-        messages=composer_messages, temperature=0.2, thinking=False,
+        messages=composer_messages, temperature=0.3, thinking=False,
     )
     timings["compose_ms"] = int((time.time() - t0) * 1000)
     llm_calls += 1
@@ -520,7 +520,7 @@ def fast_query_stream(instance: GraphInstance, question: str,
     })
 
     for event in client.chat_stream(
-        messages=composer_messages, temperature=0.2, thinking=False,
+        messages=composer_messages, temperature=0.3, thinking=False,
     ):
         if event.token:
             yield event.token

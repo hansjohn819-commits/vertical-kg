@@ -254,7 +254,7 @@ def _decompose_query(client: LocalClient, question: str) -> list[str]:
                 {"role": "system", "content": DECOMPOSER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Q: {question}\nSUB:"},
             ],
-            temperature=0.0,
+            temperature=0.3,
             thinking=False,
             timeout=30,
         )
@@ -830,7 +830,7 @@ def _maybe_summarize_history(client: LocalClient,
                 {"role": "system", "content": SUMMARIZE_HISTORY_SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
-            temperature=0.1, thinking=False,
+            temperature=0.3, thinking=False,
         )
         summary = (resp.choices[0].message.content or "").strip()
     except Exception:
@@ -867,7 +867,7 @@ def _compose(client: LocalClient, evidence_text: str, question: str,
     resp = no_retry_client.chat.completions.create(
         model=client.model,
         messages=_composer_messages(evidence_text, question, history),
-        temperature=0.2,
+        temperature=0.3,
         timeout=timeout,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
@@ -1051,7 +1051,7 @@ def qa_stream(instance: GraphInstance, question: str,
     try:
         for event in client.chat_stream(
             messages=_composer_messages(evidence_text, question, history),
-            temperature=0.2, thinking=False,
+            temperature=0.3, thinking=False,
         ):
             if event.token:
                 collected.append(event.token)

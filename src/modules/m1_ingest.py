@@ -408,7 +408,7 @@ M1_LLM_TIMEOUT_S = 600
 def _llm_with_retry(
     client, *, system: str, user: str, expect: str, raw_doc_id: str,
     run_id: str, page_num: int | None, pass_label: str, thinking: bool = True,
-    temperature: float = 0.2,
+    temperature: float = 0.3,
 ) -> tuple[object, str | None, str | None]:
     """Call the LLM, parse JSON; on parse failure dump + retry once.
     Returns (parsed_or_None, warning, finish_reason). Network/timeout
@@ -950,7 +950,7 @@ def _fuse_partial_descriptions(
             {"role": "system", "content": FUSE_SYSTEM_PROMPT},
             {"role": "user", "content": user},
         ],
-        temperature=0.1,
+        temperature=0.3,
         thinking=False,
     )
     content = resp.choices[0].message.content or ""
