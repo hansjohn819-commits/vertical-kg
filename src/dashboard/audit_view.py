@@ -19,7 +19,6 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from src.dashboard.audit_render import (
     graph_to_cytoscape,
@@ -31,7 +30,7 @@ from src.graph.instance import GraphInstance
 
 _LOG_PATH = Path(__file__).resolve().parents[2] / "log.md"
 
-# Streamlit's `components.html(height=N)` writes a fixed pixel height onto
+# Streamlit's `st.iframe(height=N)` writes a fixed pixel height onto
 # the iframe AND its wrapper. Several parent containers (block-container,
 # element-container, stMain) also have their own height constraints that
 # prevent the iframe from claiming the full viewport even when its own
@@ -55,24 +54,40 @@ _IFRAME_STRETCH_CSS = """
   }
 
   /* Layer 2: Streamlit's main block container (the inner padding wrapper).
-     Trim padding so the iframe can claim more vertical real estate. */
+     Trim padding so the iframe can claim more vertical real estate. The
+     top padding (4.2rem) reserves space for the fixed top tab nav from
+     streamlit_app.py so the cytoscape iframe doesn't render UNDER it. */
   div[data-testid="stMainBlockContainer"],
   .block-container {
     height: 100% !important;
     max-height: 100% !important;
     overflow: hidden !important;
-    padding-top: 0.5rem !important;
+    padding-top: 8.5rem !important;
     padding-bottom: 0 !important;
   }
 
   /* Layer 3: every element-container / vertical-block above the iframe
      gets shrunk to its content; the LAST one (the iframe wrapper) gets
-     flex:1 to absorb the remaining height. */
-  div[data-testid="stVerticalBlock"] { height: 100% !important; }
-  div[data-testid="stVerticalBlock"] > div:last-child { flex: 1 1 auto !important; }
-  div[data-testid="stVerticalBlock"] > div:last-child .element-container { height: 100% !important; }
+     flex:1 to absorb the remaining height.
 
-  /* Layer 4: the components.html wrapper. */
+     Scoped via :not(.st-key-topnav *) so the height:100% cascade does
+     NOT leak into the stVerticalBlock nested inside the fixed top tab
+     nav (.st-key-topnav). Without the scope, that nested block claims
+     100% of its position:fixed parent, which has no explicit height —
+     the resulting layout breaks the cytoscape iframe sizing and the
+     Graph tab renders blank. */
+  div[data-testid="stVerticalBlock"]:not(.st-key-topnav):not(.st-key-topnav *) {
+    height: 100% !important;
+  }
+  div[data-testid="stVerticalBlock"]:not(.st-key-topnav):not(.st-key-topnav *) > div:last-child {
+    flex: 1 1 auto !important;
+  }
+  div[data-testid="stVerticalBlock"]:not(.st-key-topnav):not(.st-key-topnav *) > div:last-child .element-container {
+    height: 100% !important;
+  }
+
+  /* Layer 4: the st.iframe wrapper (with stCustomComponentV1 fallback
+     for any leftover components.html call sites). */
   div[data-testid="stCustomComponentV1"],
   div[data-testid="stIFrame"] {
     height: 100% !important;
@@ -180,7 +195,7 @@ def _format_local_ts(ts: str) -> str:
 def _render_history_sidebar(events: list[dict]) -> dict | None:
     with st.sidebar:
         st.markdown("### Knowledge Graph")
-        if st.button("🔄 Refresh", use_container_width=True,
+        if st.button("🔄 Refresh", width="stretch",
                      help="Re-read the graph and event log."):
             st.rerun()
 
@@ -191,7 +206,7 @@ def _render_history_sidebar(events: list[dict]) -> dict | None:
         # it stands out from the historical event list below.
         if st.button(
             "🟢 Knowledge Graph (live)" if now_active else "Knowledge Graph (live)",
-            use_container_width=True,
+            width="stretch",
             type="primary" if now_active else "secondary",
             key="audit_now_btn",
         ):
@@ -211,7 +226,7 @@ def _render_history_sidebar(events: list[dict]) -> dict | None:
             help_text = ts + "\n" + ev["summary"]
             if st.button(
                 ("🟢 " if is_active else "") + ev["summary"],
-                use_container_width=True,
+                width="stretch",
                 key=f"audit_ev_{eid}",
                 help=help_text,
             ):
@@ -243,9 +258,9 @@ def render_audit_view(gi: GraphInstance) -> None:
 
     # Stretch-to-viewport CSS injection (one-shot per render is fine — Streamlit
     # de-dupes identical <style> blocks during a rerun). The fallback `height`
-    # passed to components.html below is a placeholder; the real sizing comes
+    # passed to st.iframe below is a placeholder; the real sizing comes
     # from this CSS override.
     st.markdown(_IFRAME_STRETCH_CSS, unsafe_allow_html=True)
 
     html_str = render_cytoscape_html(elements)
-    components.html(html_str, height=900, scrolling=False)
+    st.iframe(html_str, height=900)

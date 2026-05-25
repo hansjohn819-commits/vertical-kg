@@ -25,7 +25,6 @@ if str(_WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from src.dashboard.audit_view import render_audit_view
 from src.dashboard.chat_store import (
@@ -81,20 +80,102 @@ _HIDE_DEFAULT_NAV_CSS = """
   header[data-testid="stHeader"] { display: none !important; }
   /* And the default sidebar pages-nav (we have a custom top nav). */
   [data-testid="stSidebarNav"] { display: none !important; }
+  /* Sidebar collapse (»/«) button — there's no exposed way to re-expand
+     once collapsed in our layout, so just hide the control entirely and
+     keep the sidebar pinned open. */
+  [data-testid="stSidebarCollapseButton"],
+  [data-testid="stSidebarCollapsedControl"],
+  button[data-testid="baseButton-headerNoPadding"][kind="headerNoPadding"],
+  [data-testid="stSidebarHeader"] button {
+    display: none !important;
+  }
   /* Pull main content up to where the header used to be. */
   .stApp > div:first-child { margin-top: 0 !important; }
   .block-container {
     padding-top: 0.6rem !important;
     padding-bottom: 1rem;
   }
-  /* Snug the nav buttons against the top edge of the viewport. */
-  div[data-testid="stHorizontalBlock"]:first-of-type {
-    margin-top: 0;
+  /* === Top tab nav (Dashboard / Q&A / Graph) ===
+     The nav row is wrapped in `st.container(key="topnav")` which produces a
+     `.st-key-topnav` class on the container — every selector below is
+     scoped to that class so nothing here can leak into the left sidebar
+     or any other st.columns/st.button on the page. */
+
+  /* Pin the nav row to the top of the viewport so it stays visible while
+     the Dashboard / Q&A bodies scroll. `position: sticky` silently
+     degraded in this Streamlit (overflow chain mismatch), so we go with
+     `position: fixed`. The `left` offset reads `--app-sidebar-width`,
+     which is set live by the JS in _SIDEBAR_WIDTH_PROBE_JS — that JS
+     measures the real sidebar element on load + resize so the nav lines
+     up flush with the main column whatever width the user's sidebar
+     happens to be.
+     - Background is the configured dark theme bg (#1a1b26 in
+       .streamlit/config.toml) directly. The `--background-color` CSS var
+       isn't exposed at this scope so the previous fallback resolved to
+       white. */
+  .st-key-topnav,
+  div[data-testid="stVerticalBlockBorderWrapper"].st-key-topnav {
+    position: fixed !important;
+    top: 0 !important;
+    left: var(--app-sidebar-width, 21rem) !important;
+    right: 0 !important;
+    z-index: 1000 !important;
+    background: #1a1b26 !important;
+    /* Horizontal padding matches Streamlit's block-container default
+       (~5rem on wide layouts) so the buttons line up with the page
+       title / content below, instead of butting against the sidebar
+       edge. Top padding is generous (~4rem) so the buttons sit visually
+       LOWER than the viewport edge — flush-to-top read as cramped. */
+    padding: 3rem 5rem 1.3rem 5rem !important;
+    margin: 0 !important;
+    box-sizing: border-box !important;
   }
-  /* Slightly larger / weightier nav buttons since they're acting as a tab bar. */
-  div[data-testid="stHorizontalBlock"]:first-of-type button[kind] {
+  /* Reserve space below the fixed nav so the first rendered element
+     isn't hidden behind it. Has to track the nav's total visual height:
+     padding-top (4rem) + button row (~2.5rem) + padding-bottom (1.3rem)
+     ≈ 7.8rem, plus a ~2rem breathing gap between nav and content for
+     visual hierarchy. Graph fills its iframe inside stMain and inherits
+     whatever we put here. */
+  div[data-testid="stMainBlockContainer"],
+  .block-container {
+    padding-top: 8.5rem !important;
+  }
+
+  /* Collapse the sidebar-width JS-probe iframe wrapper to zero height so
+     it doesn't push the rest of the page down. The iframe itself is
+     loaded (height=1) and runs its JS — we just hide the visual sliver. */
+  .st-key-sbprobe {
+    height: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Slightly larger / weightier nav buttons since they're acting as a tab bar,
+     plus nowrap + ellipsis so "Dashboard" never breaks across two lines. */
+  .st-key-topnav button[kind] {
     font-weight: 600;
     letter-spacing: 0.02em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  /* Lock each of the 3 nav columns to a fixed pixel width so the buttons
+     never wrap on narrow screens AND never blow up huge on 4K screens.
+     The trailing spacer column absorbs whatever width is left over. */
+  .st-key-topnav div[data-testid="stHorizontalBlock"]
+    > div[data-testid="stColumn"]:nth-child(-n+3) {
+    flex: 0 0 140px !important;
+    width: 140px !important;
+    min-width: 140px !important;
+    max-width: 140px !important;
+  }
+  .st-key-topnav div[data-testid="stHorizontalBlock"]
+    > div[data-testid="stColumn"]:nth-child(4) {
+    flex: 1 1 auto !important;
   }
   /* Chat message body — larger text for readability (§16.14) */
   div[data-testid="stChatMessage"] p,
@@ -152,28 +233,69 @@ _HIDE_DEFAULT_NAV_CSS = """
 """
 
 
+# JS probe that publishes the live sidebar width as the CSS variable
+# `--app-sidebar-width` on the parent <html>.  Used by `.st-key-topnav`'s
+# `left: var(--app-sidebar-width, 21rem)` so the fixed top nav lines up
+# flush with the main column whatever width the user's Streamlit sidebar
+# happens to be (Streamlit default varies by version + user-drag resize).
+# Lives in a 0-height st.iframe — st.markdown strips scripts so this
+# can't be inlined with the CSS.  `window.parent.document` is safe here:
+# it's same-origin, served by the same Streamlit process.
+_SIDEBAR_WIDTH_PROBE_JS = """
+<script>
+(function() {
+  function sync() {
+    try {
+      var doc = window.parent.document;
+      var sb = doc.querySelector('section[data-testid="stSidebar"]');
+      if (!sb) return;
+      var w = sb.getBoundingClientRect().width;
+      if (w > 0) {
+        doc.documentElement.style.setProperty('--app-sidebar-width', w + 'px');
+      }
+    } catch (e) { /* cross-origin fallback uses the CSS default */ }
+  }
+  sync();
+  // Catch initial mount + sidebar resize-handle drags. ResizeObserver on the
+  // sidebar element itself would be cleaner, but the element may not exist
+  // yet on first run — interval keeps us in sync regardless.
+  window.addEventListener('resize', sync);
+  setInterval(sync, 400);
+})();
+</script>
+"""
+
+
 def _render_top_nav() -> str:
     """Render 3 buttons across the top. Active tab gets primary styling.
     Returns the active tab name."""
     st.markdown(_HIDE_DEFAULT_NAV_CSS, unsafe_allow_html=True)
+    # height=1 (st.iframe rejects 0) inside a keyed container we collapse
+    # to 0 in CSS — the iframe still loads and runs its JS, it just takes
+    # no visible space in the page.
+    with st.container(key="sbprobe"):
+        st.iframe(_SIDEBAR_WIDTH_PROBE_JS, height=1)
 
     active = st.session_state.get("active_tab", DEFAULT_TAB)
     if active not in TABS:
         active = DEFAULT_TAB
 
-    cols = st.columns([1, 1, 1, 8])  # 3 nav cells + spacer
-    for i, tab in enumerate(TABS):
-        is_active = tab == active
-        if cols[i].button(
-            tab,
-            use_container_width=True,
-            type=("primary" if is_active else "secondary"),
-            key=f"navbtn_{tab}",
-        ):
-            if tab != active:
-                st.session_state["active_tab"] = tab
-                st.rerun()
-    st.divider()
+    # Wrap nav in a keyed container so the sticky / column-width / button
+    # rules in _HIDE_DEFAULT_NAV_CSS target ONLY this nav (.st-key-topnav)
+    # without leaking into sidebar columns / chat-list rows.
+    with st.container(key="topnav"):
+        cols = st.columns([1, 1, 1, 8])  # 3 nav cells + spacer
+        for i, tab in enumerate(TABS):
+            is_active = tab == active
+            if cols[i].button(
+                tab,
+                width="stretch",
+                type=("primary" if is_active else "secondary"),
+                key=f"navbtn_{tab}",
+            ):
+                if tab != active:
+                    st.session_state["active_tab"] = tab
+                    st.rerun()
     return active
 
 
@@ -253,7 +375,7 @@ def _render_chat_sidebar(store: ChatStore, role: str) -> None:
             ),
         )
         st.divider()
-        if st.button("➕ New chat", use_container_width=True):
+        if st.button("➕ New chat", width="stretch"):
             _start_fresh_pending()
             st.rerun()
 
@@ -271,7 +393,7 @@ def _render_chat_sidebar(store: ChatStore, role: str) -> None:
                 if st.button(
                     f"{'🟢 ' if is_active else ''}{label}",
                     key=f"chat_open_{chat['id']}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     _switch_to_chat(store, chat["id"])
                     st.rerun()
@@ -358,7 +480,7 @@ _FROZEN_TIMER_TEMPLATE = """
 def _render_frozen_timer(elapsed: float) -> None:
     """Render a static timer iframe with the same wrapper as the live one
     so the layout doesn't shift when the live iframe is replaced."""
-    components.html(
+    st.iframe(
         _FROZEN_TIMER_TEMPLATE.format(elapsed=elapsed),
         height=28,
     )
@@ -604,11 +726,11 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
         t0 = time.monotonic()
 
         timer_slot = st.empty()
-        # Live JS timer in an iframe (components.html executes scripts).
+        # Live JS timer in an iframe (st.iframe executes scripts).
         # Wrapped in st.empty() so we can replace it the moment the stream
         # ends — otherwise the iframe keeps ticking until st.rerun().
         with timer_slot:
-            components.html(
+            st.iframe(
                 """
                 <style>
                     html, body { margin: 0; padding: 0; overflow: hidden; }
@@ -689,7 +811,11 @@ def _render_qa_tab(gi: GraphInstance, store: ChatStore) -> None:
 # --- Main ------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Seaweed Industry Insights", layout="wide")
+    st.set_page_config(
+        page_title="Seaweed Industry Insights",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     gi = _load_instance()
     store = _load_chat_store()
 
